@@ -998,13 +998,42 @@ export class GitService {
 	 * @param issueIdentifier - The issue identifier (e.g., "DEF-123")
 	 * @param options - Optional teardown wiring (see {@link DeleteWorktreeOptions})
 	 */
+	/**
+	 * Find the workspace directory to delete for an issue.
+	 *
+	 * Worktrees are created under the repository's `workspaceBaseDir`, which
+	 * can differ from the default `<cyrusHome>/worktrees`. Check each involved
+	 * repository's base dir first, then the default, and use the first that
+	 * exists. When none exist, return the default so the caller logs "nothing
+	 * to delete" as before.
+	 */
+	private resolveWorkspacePathForDeletion(
+		issueIdentifier: string,
+		repositories: RepositoryConfig[] = [],
+	): string {
+		const defaultPath = join(
+			getDefaultWorktreesDir(this.cyrusHome),
+			issueIdentifier,
+		);
+		const candidates = [
+			...new Set([
+				...repositories
+					.map((repo) => repo.workspaceBaseDir)
+					.filter((dir): dir is string => Boolean(dir))
+					.map((dir) => join(dir, issueIdentifier)),
+				defaultPath,
+			]),
+		];
+		return candidates.find((path) => existsSync(path)) ?? defaultPath;
+	}
+
 	async deleteWorktree(
 		issueIdentifier: string,
 		options: DeleteWorktreeOptions = {},
 	): Promise<void> {
-		const workspacePath = join(
-			getDefaultWorktreesDir(this.cyrusHome),
+		const workspacePath = this.resolveWorkspacePathForDeletion(
 			issueIdentifier,
+			options.repositories,
 		);
 
 		if (!existsSync(workspacePath)) {

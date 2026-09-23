@@ -916,6 +916,75 @@ describe("GitService", () => {
 			);
 		});
 
+		it("deletes worktrees under the repository's workspaceBaseDir", async () => {
+			// Created under a custom workspaceBaseDir, not <cyrusHome>/worktrees.
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/srv/worktrees/DEF-123") return true;
+				if (p === "/srv/worktrees/DEF-123/.git") return true;
+				if (p === "/home/user/repos/my-repo") return true;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/srv/worktrees/DEF-123/.git") {
+					return { isFile: () => true } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+			mockReadFileSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/srv/worktrees/DEF-123/.git") {
+					return "gitdir: /home/user/repos/my-repo/.git/worktrees/DEF-123";
+				}
+				return "";
+			});
+			mockExecSync.mockReturnValue(Buffer.from(""));
+
+			await gitService.deleteWorktree("DEF-123", {
+				repositories: [
+					{
+						id: "my-repo",
+						name: "my-repo",
+						repositoryPath: "/home/user/repos/my-repo",
+						workspaceBaseDir: "/srv/worktrees",
+					} as any,
+				],
+			});
+
+			expect(mockExecSync).toHaveBeenCalledWith(
+				'git worktree remove --force "/srv/worktrees/DEF-123"',
+				expect.anything(),
+			);
+			expect(mockRmSync).toHaveBeenCalledWith(
+				"/srv/worktrees/DEF-123",
+				expect.anything(),
+			);
+		});
+
+		it("falls back to the default worktrees dir when the repo's base dir has no workspace", async () => {
+			mockExistsSync.mockImplementation(
+				(path: any) => String(path) === "/home/user/.cyrus/worktrees/DEF-123",
+			);
+			mockExecSync.mockReturnValue(Buffer.from(""));
+
+			await gitService.deleteWorktree("DEF-123", {
+				repositories: [
+					{
+						id: "my-repo",
+						name: "my-repo",
+						repositoryPath: "/home/user/repos/my-repo",
+						workspaceBaseDir: "/srv/worktrees",
+					} as any,
+				],
+			});
+
+			expect(mockRmSync).toHaveBeenCalledWith(
+				"/home/user/.cyrus/worktrees/DEF-123",
+				expect.anything(),
+			);
+		});
+
 		it("removes single-repo worktree and deletes directory", async () => {
 			mockExistsSync.mockImplementation((path: any) => {
 				const p = String(path);
