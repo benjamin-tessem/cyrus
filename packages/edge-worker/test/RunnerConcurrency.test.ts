@@ -7,7 +7,13 @@
 
 import type { AgentSessionInfo, IAgentRunner } from "cyrus-core";
 import { describe, expect, it, vi } from "vitest";
-import { capRunnerStarts, SessionSemaphore } from "../src/RunnerConcurrency.js";
+import {
+	capRunnerStarts,
+	carryIntoPendingStart,
+	RunnerStartCancelledError,
+	SessionSemaphore,
+	takePendingStartPrompt,
+} from "../src/RunnerConcurrency.js";
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
@@ -28,12 +34,21 @@ function fakeRunner(streaming: boolean) {
 	const streamingGate = deferred<AgentSessionInfo>();
 	const started = vi.fn(() => startGate.promise);
 	const startedStreaming = vi.fn(() => streamingGate.promise);
+	const stopped = vi.fn();
 	const runner = {
 		supportsStreamingInput: streaming,
 		start: started,
+		stop: stopped,
 		...(streaming ? { startStreaming: startedStreaming } : {}),
 	} as unknown as IAgentRunner;
-	return { runner, started, startedStreaming, startGate, streamingGate };
+	return {
+		runner,
+		started,
+		startedStreaming,
+		stopped,
+		startGate,
+		streamingGate,
+	};
 }
 
 async function settled(): Promise<void> {
@@ -325,3 +340,165 @@ describe("capRunnerStarts", () => {
 		expect(addStreamMessage).toHaveBeenCalledWith("follow-up");
 	});
 });
+
+describe("stopping a runner before it holds a slot", () => {
+	it("withdraws a queued start without touching the active count", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const queued = fakeRunner(true);
+		const runningWrapped = capRunnerStarts(running.runner, semaphore);
+		const queuedWrapped = capRunnerStarts(queued.runner, semaphore, true);
+
+		const runningDone = runningWrapped.start("a");
+		const queuedDone = queuedWrapped.startStreaming?.("reply");
+		await settled();
+		expect(semaphore.active).toBe(1);
+		expect(semaphore.waiting).toBe(1);
+
+		queuedWrapped.stop();
+		await expect(queuedDone).rejects.toBeInstanceOf(RunnerStartCancelledError);
+		await expect(queuedDone).rejects.toMatchObject({ prompt: "reply" });
+		expect(semaphore.active).toBe(1);
+		expect(semaphore.waiting).toBe(0);
+		// The underlying runner's own stop() is a no-op before start; it isn't called.
+		expect(queued.stopped).not.toHaveBeenCalled();
+
+		running.startGate.resolve(sessionInfo("s1"));
+		await runningDone;
+		expect(semaphore.active).toBe(0);
+	});
+
+	it("never starts the underlying runner once stopped while queued", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const queued = fakeRunner(false);
+		const runningDone = capRunnerStarts(running.runner, semaphore).start("a");
+		const queuedWrapped = capRunnerStarts(queued.runner, semaphore);
+		const queuedDone = queuedWrapped.start("old prompt");
+		await settled();
+
+		queuedWrapped.stop();
+		await expect(queuedDone).rejects.toBeInstanceOf(RunnerStartCancelledError);
+
+		// The slot frees up; the stale start must not take it.
+		running.startGate.resolve(sessionInfo("s1"));
+		await runningDone;
+		await settled();
+		expect(queued.started).not.toHaveBeenCalled();
+		expect(semaphore.active).toBe(0);
+	});
+
+	it("rejects a start() made after stop() on an idle runner", async () => {
+		// resumeAgentSession registers a runner, then awaits prompt building
+		// before start(). A follow-up in that window stops it first.
+		const semaphore = new SessionSemaphore(1);
+		const idle = fakeRunner(false);
+		const wrapped = capRunnerStarts(idle.runner, semaphore);
+
+		wrapped.stop();
+		await expect(wrapped.start("late prompt")).rejects.toMatchObject({
+			name: "RunnerStartCancelledError",
+			prompt: "late prompt",
+		});
+		expect(idle.started).not.toHaveBeenCalled();
+		expect(semaphore.active).toBe(0);
+	});
+
+	it("releases exactly once when stopped between admission and starting", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+		const queued = fakeRunner(false);
+		const wrapped = capRunnerStarts(queued.runner, semaphore);
+		const done = wrapped.start("p");
+		await settled();
+
+		// release() admits the waiter synchronously; stop() lands before the
+		// gate's continuation runs.
+		semaphore.release();
+		wrapped.stop();
+
+		await expect(done).rejects.toBeInstanceOf(RunnerStartCancelledError);
+		expect(queued.started).not.toHaveBeenCalled();
+		expect(semaphore.active).toBe(0);
+		expect(semaphore.waiting).toBe(0);
+	});
+
+	it("passes stop() through once the runner holds a slot, releasing once", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const next = fakeRunner(false);
+		const wrapped = capRunnerStarts(running.runner, semaphore);
+		const done = wrapped.start("a");
+		const nextDone = capRunnerStarts(next.runner, semaphore).start("b");
+		await settled();
+
+		wrapped.stop();
+		expect(running.stopped).toHaveBeenCalledOnce();
+		// The real runner ends its session when stopped.
+		running.startGate.resolve(sessionInfo("s1"));
+		await done;
+		await settled();
+
+		// Exactly one slot came back: the next runner holds it, count is 1.
+		expect(next.started).toHaveBeenCalledOnce();
+		expect(semaphore.active).toBe(1);
+		next.startGate.resolve(sessionInfo("s2"));
+		await nextDone;
+		expect(semaphore.active).toBe(0);
+	});
+});
+
+describe("carrying a replaced start's prompt forward", () => {
+	it("hands a queued prompt to the replacement, ahead of its own", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const runningDone = capRunnerStarts(running.runner, semaphore).start("a");
+
+		const old = capRunnerStarts(fakeRunner(false).runner, semaphore, true);
+		const oldDone = old.start("user reply");
+		await settled();
+
+		// What resumeAgentSession does when a newer follow-up arrives.
+		const carried = takePendingStartPrompt(old);
+		old.stop();
+		const replacement = fakeRunner(false);
+		const replacementWrapped = capRunnerStarts(
+			replacement.runner,
+			semaphore,
+			true,
+		);
+		expect(carriedPrompt(carried, replacementWrapped)).toBe(true);
+		const replacementDone = replacementWrapped.start("CI failed");
+
+		// Taken once: the cancelled start doesn't offer it again.
+		await expect(oldDone).rejects.toMatchObject({ prompt: undefined });
+
+		running.startGate.resolve(sessionInfo("s1"));
+		await runningDone;
+		await settled();
+		const prompt = replacement.started.mock.calls[0]?.[0] as string;
+		expect(prompt.indexOf("user reply")).toBeGreaterThan(-1);
+		expect(prompt.indexOf("user reply")).toBeLessThan(
+			prompt.indexOf("CI failed"),
+		);
+		replacement.startGate.resolve(sessionInfo("s2"));
+		await replacementDone;
+	});
+
+	it("doesn't carry into a runner that already started", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const wrapped = capRunnerStarts(running.runner, semaphore);
+		void wrapped.start("a");
+		await settled();
+		expect(carryIntoPendingStart(wrapped, "late")).toBe(false);
+		expect(takePendingStartPrompt(wrapped)).toBeUndefined();
+	});
+});
+
+function carriedPrompt(
+	carried: string | undefined,
+	runner: IAgentRunner,
+): boolean {
+	return carried !== undefined && carryIntoPendingStart(runner, carried);
+}

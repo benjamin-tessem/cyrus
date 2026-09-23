@@ -176,7 +176,13 @@ import {
 	RepositoryRouter,
 	type RepositoryRouterDeps,
 } from "./RepositoryRouter.js";
-import { capRunnerStarts, SessionSemaphore } from "./RunnerConcurrency.js";
+import {
+	capRunnerStarts,
+	carryIntoPendingStart,
+	RunnerStartCancelledError,
+	SessionSemaphore,
+	takePendingStartPrompt,
+} from "./RunnerConcurrency.js";
 import {
 	RunnerConfigBuilder,
 	resolveIssueMcpConfigPath,
@@ -4908,6 +4914,10 @@ ${taskSection}`;
 			// Note: AgentSessionManager will be initialized automatically when the first system message
 			// is received via handleClaudeMessage() callback
 		} catch (error) {
+			if (error instanceof RunnerStartCancelledError) {
+				this.handleCancelledStart(sessionId, agentSessionManager, error);
+				return;
+			}
 			log.error(`Error in prompt building/starting:`, error);
 			throw error;
 		}
@@ -7647,8 +7657,12 @@ ${input.userComment}
 			}
 		}
 
-		// Stop existing runner if it's not running
+		// Stop existing runner if it's not running. If it was still waiting for
+		// a slot, stop() cancels it; take its undelivered prompt (e.g. an
+		// earlier reply) so the new runner delivers it.
+		let carriedPrompt: string | undefined;
 		if (existingRunner) {
+			carriedPrompt = takePendingStartPrompt(existingRunner);
 			existingRunner.stop();
 		}
 
@@ -7762,6 +7776,9 @@ ${input.userComment}
 
 		// Create the appropriate runner based on session state
 		const runner = this.createRunnerForType(runnerType, runnerConfig, true);
+		if (carriedPrompt) {
+			carryIntoPendingStart(runner, carriedPrompt);
+		}
 
 		// Store runner
 		agentSessionManager.addAgentRunner(sessionId, runner);
@@ -7789,9 +7806,53 @@ ${input.userComment}
 				await runner.start(fullPrompt);
 			}
 		} catch (error) {
+			if (error instanceof RunnerStartCancelledError) {
+				this.handleCancelledStart(sessionId, agentSessionManager, error);
+				return;
+			}
 			log.error(`Failed to start streaming session for ${sessionId}:`, error);
 			throw error;
 		}
+	}
+
+	/**
+	 * A runner was stopped while waiting for a concurrency slot, so its
+	 * session never started. That is expected, not an error: the session was
+	 * stopped, or a newer runner replaced it. When replaced, the cancelled
+	 * start's prompt (if nobody took it yet) goes to the replacement so the
+	 * message isn't lost.
+	 */
+	private handleCancelledStart(
+		sessionId: string,
+		agentSessionManager: AgentSessionManager,
+		error: RunnerStartCancelledError,
+	): void {
+		const log = this.logger.withContext({ sessionId });
+		if (!error.prompt) {
+			log.info("Queued session start cancelled before it began");
+			return;
+		}
+		const current = agentSessionManager.getAgentRunner(sessionId);
+		if (current && carryIntoPendingStart(current, error.prompt)) {
+			log.info(
+				"Queued session start replaced before it began; carried its prompt into the replacement",
+			);
+			return;
+		}
+		if (current?.isRunning() && current.addStreamMessage) {
+			try {
+				current.addStreamMessage(error.prompt);
+				log.info(
+					"Queued session start replaced before it began; streamed its prompt into the running session",
+				);
+				return;
+			} catch {
+				// Fall through to the warning below.
+			}
+		}
+		log.info(
+			"Queued session start cancelled before it began; its prompt was not delivered",
+		);
 	}
 
 	/**
