@@ -41,6 +41,28 @@ describe("LinearActivitySink", () => {
 	});
 
 	describe("postActivity()", () => {
+		it("uses the id from the mutation response without re-fetching the activity", async () => {
+			// Re-fetching (awaiting result.agentActivity) is a second request that
+			// can fail after the post already succeeded.
+			const payload = {
+				success: true,
+				agentActivityId: "activity-from-payload",
+				get agentActivity(): Promise<{ id: string }> {
+					throw new Error("must not re-fetch the activity");
+				},
+			};
+			vi.mocked(mockIssueTracker.createAgentActivity).mockResolvedValue(
+				payload as any,
+			);
+
+			const result = await sink.postActivity(mockSessionId, {
+				type: "thought",
+				body: "hi",
+			});
+
+			expect(result).toEqual({ activityId: "activity-from-payload" });
+		});
+
 		it("should post a thought activity and return activityId", async () => {
 			const activity: AgentActivityContent = {
 				type: "thought",

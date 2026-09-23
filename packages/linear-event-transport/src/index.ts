@@ -5,6 +5,12 @@ export {
 	type LinearOAuthConfig,
 } from "./LinearIssueTrackerService.js";
 export { LinearMessageTranslator } from "./LinearMessageTranslator.js";
+export {
+	classifyLinearError,
+	describeLinearRequest,
+	type LinearRetryOptions,
+	withLinearRetry,
+} from "./linearRetry.js";
 export type {
 	LinearEventTransportConfig,
 	LinearEventTransportEvents,

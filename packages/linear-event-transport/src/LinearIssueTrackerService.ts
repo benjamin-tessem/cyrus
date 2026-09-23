@@ -26,6 +26,7 @@ export interface LinearOAuthConfig {
 	}) => void | Promise<void>;
 }
 
+import { randomUUID } from "node:crypto";
 import type {
 	AgentActivityCreateInput,
 	AgentActivityPayload,
@@ -52,6 +53,12 @@ import type {
 } from "cyrus-core";
 import { createLogger, type ILogger } from "cyrus-core";
 import { LinearEventTransport } from "./LinearEventTransport.js";
+import {
+	classifyLinearError,
+	describeLinearRequest,
+	type LinearRetryOptions,
+	withLinearRetry,
+} from "./linearRetry.js";
 
 /**
  * Linear implementation of IIssueTrackerService.
@@ -79,6 +86,7 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	private oauthConfig?: LinearOAuthConfig;
 	private logger: ILogger;
 	private refreshPromise: Promise<string> | null = null;
+	private readonly retryOptions?: LinearRetryOptions;
 
 	/**
 	 * Static map for workspace-level coalescing of concurrent token refreshes.
@@ -98,13 +106,16 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	 * @param linearClient - Configured LinearClient instance
 	 * @param oauthConfig - Optional OAuth config for automatic token refresh on 401 errors
 	 * @param logger - Optional logger instance
+	 * @param retryOptions - Optional overrides for transient-failure retries (tests)
 	 */
 	constructor(
 		linearClient: LinearClient,
 		oauthConfig?: LinearOAuthConfig,
 		logger?: ILogger,
+		retryOptions?: LinearRetryOptions,
 	) {
 		this.linearClient = linearClient;
+		this.retryOptions = retryOptions;
 		this.oauthConfig = oauthConfig;
 		this.logger =
 			logger ?? createLogger({ component: "LinearIssueTrackerService" });
@@ -117,18 +128,18 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 			);
 		}
 
-		// Only patch if oauthConfig is provided AND linearClient.client exists
-		// (the .client property may not exist in test mocks)
-		if (oauthConfig && linearClient.client) {
+		// Patch the GraphQL client's request(): every SDK call (queries, mutations
+		// and lazy relation fetches) goes through it. Skipped when .client is
+		// missing (test mocks).
+		if (linearClient.client) {
 			const client = linearClient.client;
 			const originalRequest = client.request.bind(client);
 
-			// Track the current refresh promise - coalesces concurrent 401 errors.
-			// Cleared when refresh fails or when setAccessToken() is called.
-
-			client.request = async <Data, Variables extends Record<string, unknown>>(
+			// Layer 1: refresh the OAuth token once on 401 and replay (only when
+			// OAuth is configured).
+			const authedRequest = async <Data>(
 				document: string,
-				variables?: Variables,
+				variables?: Record<string, unknown>,
 				requestHeaders?: RequestInit["headers"],
 				isRetry = false,
 			): Promise<Data> => {
@@ -141,9 +152,11 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 				} catch (error) {
 					// Don't retry if this is already a retry attempt (prevents infinite loops)
 					// or if it's not a token expiration error
-					if (isRetry || !this.isTokenExpiredError(error)) throw error;
+					if (!this.oauthConfig || isRetry || !this.isTokenExpiredError(error))
+						throw error;
 
 					// Coalesce concurrent refresh attempts - everyone shares the same promise.
+					// Cleared when refresh fails or when setAccessToken() is called.
 					if (!this.refreshPromise) {
 						this.refreshPromise = this.doTokenRefresh().catch(
 							(refreshError) => {
@@ -155,26 +168,35 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 						);
 					}
 
+					let newToken: string;
 					try {
-						const newToken = await this.refreshPromise;
-						// Clear cached promise so future token expirations trigger a fresh refresh.
-						// Workspace-level coalescing via pendingRefreshes still deduplicates concurrent calls.
-						this.refreshPromise = null;
-						client.setHeader("Authorization", `Bearer ${newToken}`);
-
-						// Retry the request with the new token (marked as retry to prevent loops)
-						return (await (client.request as any)(
-							document,
-							variables,
-							requestHeaders,
-							true, // isRetry flag
-						)) as Data;
+						newToken = await this.refreshPromise;
 					} catch (_refreshError) {
 						// If refresh failed, throw the original 401 error for clarity
 						throw error;
 					}
+					// Clear cached promise so future token expirations trigger a fresh refresh.
+					// Workspace-level coalescing via pendingRefreshes still deduplicates concurrent calls.
+					this.refreshPromise = null;
+					client.setHeader("Authorization", `Bearer ${newToken}`);
+
+					// Retry the request with the new token (marked as retry to prevent loops)
+					return authedRequest<Data>(document, variables, requestHeaders, true);
 				}
 			};
+
+			// Layer 2: bounded retry on transient failures (5xx, network, rate
+			// limit). Outermost, so each attempt still gets the 401 handling.
+			client.request = (<Data, Variables extends Record<string, unknown>>(
+				document: string,
+				variables?: Variables,
+				requestHeaders?: RequestInit["headers"],
+			): Promise<Data> =>
+				withLinearRetry(
+					() => authedRequest<Data>(document, variables, requestHeaders),
+					describeLinearRequest(document, variables),
+					{ logger: this.logger, ...this.retryOptions },
+				)) as typeof client.request;
 		}
 	}
 
@@ -813,11 +835,35 @@ export class LinearIssueTrackerService implements IIssueTrackerService {
 	/**
 	 * Post an agent activity to an agent session.
 	 * Signature matches Linear SDK's createAgentActivity exactly.
+	 *
+	 * The activity gets a client-generated id unless the caller set one. That
+	 * makes the mutation idempotent, so the transport retry may replay it after
+	 * an ambiguous failure (5xx, connection reset) without posting twice.
 	 */
 	async createAgentActivity(
 		input: AgentActivityCreateInput,
 	): Promise<AgentActivityPayload> {
-		return await this.linearClient.createAgentActivity(input);
+		const id = input.id ?? randomUUID();
+		try {
+			return await this.linearClient.createAgentActivity({ ...input, id });
+		} catch (error) {
+			// An earlier attempt may have been applied with its response lost, and
+			// the replay then rejected (e.g. as a duplicate id) or also lost. If the
+			// activity exists, the post succeeded.
+			const existing = await this.linearClient
+				.agentActivity(id)
+				.catch(() => undefined);
+			if (!existing) throw error;
+			this.logger.warn(
+				`Agent activity ${id} was created despite an error on the final attempt (${classifyLinearError(error).kind}); treating the post as successful`,
+			);
+			return {
+				success: true,
+				lastSyncId: 0,
+				agentActivityId: id,
+				agentActivity: Promise.resolve(existing),
+			} as unknown as AgentActivityPayload;
+		}
 	}
 
 	// ========================================================================

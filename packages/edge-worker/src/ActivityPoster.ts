@@ -29,10 +29,13 @@ export class ActivityPoster {
 		try {
 			const result = await issueTracker.createAgentActivity(input);
 			if (result.success) {
-				if (result.agentActivity) {
-					const activity = await result.agentActivity;
-					this.logger.debug(`Created ${label} activity ${activity.id}`);
-					return activity.id;
+				// Prefer the id from the mutation response over re-fetching the
+				// activity (a second request that can fail after the post succeeded).
+				const activityId =
+					result.agentActivityId ?? (await result.agentActivity)?.id;
+				if (activityId) {
+					this.logger.debug(`Created ${label} activity ${activityId}`);
+					return activityId;
 				}
 				this.logger.debug(`Created ${label}`);
 				return null;

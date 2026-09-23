@@ -97,9 +97,13 @@ export class LinearActivitySink implements IActivitySink {
 			}),
 		});
 
-		if (result.success && result.agentActivity) {
-			const agentActivity = await result.agentActivity;
-			return { activityId: agentActivity.id };
+		if (result.success) {
+			// The mutation response already carries the id; awaiting
+			// result.agentActivity would re-fetch the whole activity in a second
+			// request that can fail after the post succeeded.
+			const activityId =
+				result.agentActivityId ?? (await result.agentActivity)?.id;
+			if (activityId) return { activityId };
 		}
 
 		return {};
