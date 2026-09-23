@@ -1765,7 +1765,7 @@ export class EdgeWorker extends EventEmitter {
 				}
 			};
 
-			runner = this.createRunnerForType(runnerType, runnerConfig);
+			runner = this.createRunnerForType(runnerType, runnerConfig, true);
 
 			// Store the runner in the session manager
 			agentSessionManager.addAgentRunner(githubSessionId, runner);
@@ -2473,7 +2473,7 @@ ${taskSection}`;
 					"gitlab", // sessionPlatform → uses githubMcpConfigs override
 				);
 
-			const runner = this.createRunnerForType(runnerType, runnerConfig);
+			const runner = this.createRunnerForType(runnerType, runnerConfig, true);
 
 			// Store the runner in the session manager
 			agentSessionManager.addAgentRunner(gitlabSessionId, runner);
@@ -5626,14 +5626,20 @@ ${taskSection}`;
 	 * global concurrency slot for the session's lifetime — this is the single
 	 * choke point that makes `maxConcurrentSessions` cover Linear, GitHub,
 	 * GitLab, and chat sessions alike.
+	 *
+	 * `priority` marks a follow-up on existing work (a Linear reply, a
+	 * GitHub/GitLab review or comment); it queues ahead of new tickets when
+	 * every slot is taken.
 	 */
 	private createRunnerForType(
 		runnerType: RunnerType,
 		config: AgentRunnerConfig,
+		priority = false,
 	): IAgentRunner {
 		return capRunnerStarts(
 			this.buildRunnerForType(runnerType, config),
 			this.runnerSlots,
+			priority,
 		);
 	}
 
@@ -7688,7 +7694,7 @@ ${input.userComment}
 			);
 
 		// Create the appropriate runner based on session state
-		const runner = this.createRunnerForType(runnerType, runnerConfig);
+		const runner = this.createRunnerForType(runnerType, runnerConfig, true);
 
 		// Store runner
 		agentSessionManager.addAgentRunner(sessionId, runner);

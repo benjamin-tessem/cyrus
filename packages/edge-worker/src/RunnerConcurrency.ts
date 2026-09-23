@@ -12,16 +12,25 @@
 
 import type { IAgentRunner } from "cyrus-core";
 
+interface Waiter {
+	admit: () => void;
+	priority: boolean;
+}
+
 /**
  * Counting semaphore with FIFO waiters and a live-adjustable limit.
  *
  * `Number.POSITIVE_INFINITY` means uncapped — `acquire()` resolves
  * immediately. Lowering the limit never interrupts running sessions; it
  * simply stops admitting new ones until enough slots free up.
+ *
+ * Priority waiters (follow-ups on existing work: a Linear reply, a PR review
+ * or comment) queue ahead of normal ones (brand-new tickets), FIFO among
+ * themselves, so fixing a red PR doesn't wait behind every new ticket.
  */
 export class SessionSemaphore {
 	private activeCount = 0;
-	private waiters: Array<() => void> = [];
+	private waiters: Waiter[] = [];
 
 	constructor(
 		private limit: number,
@@ -46,17 +55,24 @@ export class SessionSemaphore {
 		return this.limit;
 	}
 
-	acquire(): Promise<void> {
+	acquire(priority = false): Promise<void> {
 		if (this.activeCount < this.limit) {
 			this.activeCount++;
 			return Promise.resolve();
 		}
 		return new Promise<void>((resolve) => {
-			this.waiters.push(resolve);
+			const waiter: Waiter = { admit: resolve, priority };
+			const firstNormal = this.waiters.findIndex((w) => !w.priority);
+			if (priority && firstNormal !== -1) {
+				this.waiters.splice(firstNormal, 0, waiter);
+			} else {
+				this.waiters.push(waiter);
+			}
 			this.onQueued?.(
 				`Session start queued: ${this.activeCount} running at the ` +
 					`maxConcurrentSessions limit of ${this.limit}, ` +
-					`${this.waiters.length} waiting`,
+					`${this.waiters.length} waiting` +
+					(priority ? " (follow-up: queued ahead of new tickets)" : ""),
 			);
 		});
 	}
@@ -89,7 +105,7 @@ export class SessionSemaphore {
 		while (this.waiters.length > 0 && this.activeCount < this.limit) {
 			this.activeCount++;
 			const next = this.waiters.shift();
-			next?.();
+			next?.admit();
 		}
 	}
 }
@@ -104,13 +120,16 @@ export class SessionSemaphore {
  * The wrapper is a Proxy rather than an instance mutation: the underlying
  * runner is never modified, every other property forwards through unchanged,
  * and the original methods stay observable (e.g. as test spies).
+ *
+ * `priority` marks a follow-up on existing work; see {@link SessionSemaphore}.
  */
 export function capRunnerStarts(
 	runner: IAgentRunner,
 	semaphore: SessionSemaphore,
+	priority = false,
 ): IAgentRunner {
 	const gate = async <T>(run: () => Promise<T>): Promise<T> => {
-		await semaphore.acquire();
+		await semaphore.acquire(priority);
 		try {
 			return await run();
 		} finally {

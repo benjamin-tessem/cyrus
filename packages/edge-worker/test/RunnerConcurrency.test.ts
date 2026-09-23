@@ -128,6 +128,59 @@ describe("SessionSemaphore", () => {
 		expect(onQueued).toHaveBeenCalledOnce();
 	});
 
+	it("queues priority waiters ahead of normal ones, FIFO among themselves", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+
+		const order: string[] = [];
+		const waits = [
+			semaphore.acquire().then(() => order.push("new-1")),
+			semaphore.acquire().then(() => order.push("new-2")),
+			semaphore.acquire(true).then(() => order.push("follow-up-1")),
+			semaphore.acquire(true).then(() => order.push("follow-up-2")),
+			semaphore.acquire().then(() => order.push("new-3")),
+		];
+		for (let i = 0; i < waits.length; i++) {
+			semaphore.release();
+			await settled();
+		}
+		await Promise.all(waits);
+		expect(order).toEqual([
+			"follow-up-1",
+			"follow-up-2",
+			"new-1",
+			"new-2",
+			"new-3",
+		]);
+	});
+
+	it("appends priority waiters when only priority waiters are queued", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+
+		const order: number[] = [];
+		const first = semaphore.acquire(true).then(() => order.push(1));
+		const second = semaphore.acquire(true).then(() => order.push(2));
+
+		semaphore.release();
+		await first;
+		semaphore.release();
+		await second;
+		expect(order).toEqual([1, 2]);
+	});
+
+	it("marks priority queueing in the onQueued message", async () => {
+		const onQueued = vi.fn();
+		const semaphore = new SessionSemaphore(1, onQueued);
+		await semaphore.acquire();
+		void semaphore.acquire();
+		void semaphore.acquire(true);
+		expect(onQueued.mock.calls[0]?.[0]).not.toContain("follow-up");
+		expect(onQueued.mock.calls[1]?.[0]).toContain(
+			"(follow-up: queued ahead of new tickets)",
+		);
+	});
+
 	it("rejects invalid limits", () => {
 		expect(() => new SessionSemaphore(0)).toThrow();
 		expect(() => new SessionSemaphore(Number.NaN)).toThrow();
@@ -199,6 +252,26 @@ describe("capRunnerStarts", () => {
 		next.startGate.resolve(sessionInfo("s2"));
 		await nextDone;
 		expect(semaphore.active).toBe(0);
+	});
+
+	it("starts a priority runner before an earlier-queued normal one", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const running = fakeRunner(false);
+		const newTicket = fakeRunner(false);
+		const followUp = fakeRunner(false);
+
+		const runningDone = capRunnerStarts(running.runner, semaphore).start("a");
+		void capRunnerStarts(newTicket.runner, semaphore).start("new");
+		void capRunnerStarts(followUp.runner, semaphore, true).start("reply");
+		await settled();
+		expect(newTicket.started).not.toHaveBeenCalled();
+		expect(followUp.started).not.toHaveBeenCalled();
+
+		running.startGate.resolve(sessionInfo("s1"));
+		await runningDone;
+		await settled();
+		expect(followUp.started).toHaveBeenCalledOnce();
+		expect(newTicket.started).not.toHaveBeenCalled();
 	});
 
 	it("does not add startStreaming to runners without it", () => {
