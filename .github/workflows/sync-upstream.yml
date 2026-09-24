@@ -1,0 +1,145 @@
+name: Sync upstream release
+
+# Keeps this fork's main on the latest upstream Cyrus release. Our changes
+# live as ordinary commits on main; each new upstream release tag is MERGED
+# in (never rebased), so every commit a deployment has pinned stays on main
+# and fetchable forever.
+#
+# - Clean merge, checks green: pushed straight to main.
+# - Conflict, or checks red: pushes sync/<tag> and opens a pull request
+#   into main, so there is one place to see what broke and fix it.
+#
+# Deploying the result is a separate, manual step (bump the pinned commit wherever it is deployed).
+#
+# Pushing a merge that touches .github/workflows needs a token with the
+# Workflows permission, which the built-in GITHUB_TOKEN never has. Set a
+# fine-grained PAT for this repository (Contents, Pull requests and
+# Workflows: read and write) as the SYNC_TOKEN secret; without it, syncs
+# still work until an upstream release changes its workflows.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to merge (default latest release)
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Find the upstream release to merge
+        id: tag
+        run: |
+          git remote add upstream https://github.com/cyrusagents/cyrus.git
+          git fetch --quiet --no-tags upstream '+refs/tags/v*:refs/tags/v*'
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            # Releases only (vX.Y.Z), never pre-releases.
+            tag=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag" HEAD; then
+            echo "main already contains $tag"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          elif gh pr list --head "sync/$tag" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "a pull request for $tag is already open"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge
+        id: merge
+        if: steps.tag.outputs.needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tag="${{ steps.tag.outputs.tag }}"
+          if git merge --no-edit -m "chore: merge upstream $tag" "$tag"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v7
+        if: steps.merge.outputs.conflict == 'false'
+        with:
+          node-version: 24.x
+          package-manager-cache: false
+
+      - name: Install dependencies
+        if: steps.merge.outputs.conflict == 'false'
+        uses: ./.github/actions/install-dependencies
+
+      - name: Checks (lint, build, typecheck, tests)
+        id: checks
+        if: steps.merge.outputs.conflict == 'false'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cat > .env << EOF
+          LINEAR_WEBHOOK_SECRET=test
+          WEBHOOK_PORT=3000
+          WORKSPACE_BASE_DIR=./tmp/workspaces
+          PROMPT_TEMPLATE_PATH=./examples/prompt-template.txt
+          ANTHROPIC_API_KEY=test
+          EOF
+          { pnpm biome ci && pnpm build && pnpm typecheck && pnpm -r test:run; } 2>&1 \
+            | tee "$RUNNER_TEMP/checks.log"
+
+      - name: Push to main
+        if: steps.merge.outputs.conflict == 'false' && steps.checks.outcome == 'success'
+        run: git push origin HEAD:main
+
+      - name: Open a pull request instead
+        if: >-
+          steps.merge.outputs.conflict == 'true' ||
+          (steps.merge.outputs.conflict == 'false' && steps.checks.outcome != 'success')
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "${{ steps.merge.outputs.conflict }}" = true ]; then
+            # The PR merges the release into main, so GitHub shows the
+            # conflicts to resolve.
+            git push --force origin "$tag^{commit}:refs/heads/sync/$tag"
+            {
+              echo "Upstream $tag does not merge cleanly into main. Conflicting files:"
+              echo
+              # shellcheck disable=SC2016 # literal backticks: markdown code spans
+              sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+              echo
+              echo "Resolve locally: \`git fetch upstream --tags && git merge $tag\` on main, fix, push."
+            } > "$RUNNER_TEMP/body.md"
+          else
+            git push --force origin "HEAD:refs/heads/sync/$tag"
+            {
+              echo "Upstream $tag merges cleanly, but the checks fail on the result. Last lines:"
+              echo
+              echo '```'
+              tail -60 "$RUNNER_TEMP/checks.log"
+              echo '```'
+            } > "$RUNNER_TEMP/body.md"
+          fi
+          gh pr create --base main --head "sync/$tag" \
+            --title "Merge upstream $tag" --body-file "$RUNNER_TEMP/body.md"
+          exit 1
