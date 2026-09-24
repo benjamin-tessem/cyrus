@@ -52,6 +52,7 @@ export interface ClaudeRunnerConfig {
 	strictMcpConfig?: boolean;
 	model?: string; // Claude model to use (e.g., "opus", "sonnet", "haiku")
 	fallbackModel?: string; // Fallback model if primary model is unavailable
+	effort?: "low" | "medium" | "high" | "xhigh" | "max"; // Reasoning effort; unset leaves the CLI default
 	maxTurns?: number; // Maximum number of turns before completing the session
 	tools?: string[]; // Built-in tools available in model context (empty array disables all tools)
 	cyrusHome: string; // Cyrus home directory

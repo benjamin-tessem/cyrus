@@ -71,6 +71,17 @@ export class RunnerSelectionService {
 	}
 
 	/**
+	 * Resolve the default reasoning effort. Only the Claude runner takes one.
+	 */
+	public getDefaultEffortForRunner(
+		runnerType: RunnerType,
+	): EdgeWorkerConfig["claudeDefaultEffort"] {
+		return runnerType === "claude"
+			? this.config.claudeDefaultEffort
+			: undefined;
+	}
+
+	/**
 	 * Resolve default fallback model for a given runner from config with sensible built-in defaults.
 	 * Supports legacy Claude fallback key for backwards compatibility.
 	 */

@@ -65,6 +65,9 @@ export interface IRunnerSelector {
 	};
 	getDefaultModelForRunner(runnerType: RunnerType): string | undefined;
 	getDefaultFallbackModelForRunner(runnerType: RunnerType): string | undefined;
+	getDefaultEffortForRunner?(
+		runnerType: RunnerType,
+	): AgentRunnerConfig["effort"] | undefined;
 }
 
 /**
@@ -413,6 +416,8 @@ export class RunnerConfigBuilder {
 			input.repository.model ||
 			this.runnerSelector.getDefaultModelForRunner(runnerType);
 
+		const effort = this.runnerSelector.getDefaultEffortForRunner?.(runnerType);
+
 		const resolvedWorkspaceId =
 			input.linearWorkspaceId ??
 			input.requireLinearWorkspaceId(input.repository);
@@ -473,6 +478,7 @@ export class RunnerConfigBuilder {
 				fallbackModelOverride ||
 				input.repository.fallbackModel ||
 				this.runnerSelector.getDefaultFallbackModelForRunner(runnerType),
+			...(effort && { effort }),
 			logger: log,
 			hooks,
 			// Plugins providing managed skills.

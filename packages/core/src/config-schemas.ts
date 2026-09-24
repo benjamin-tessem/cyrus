@@ -394,6 +394,14 @@ export const EdgeConfigSchema = z.object({
 	/** Default Claude fallback model if primary Claude model is unavailable */
 	claudeDefaultFallbackModel: z.string().optional(),
 
+	/**
+	 * Default Claude reasoning effort (low, medium, high, xhigh, max). Unset
+	 * leaves it to Claude Code, which defaults to high.
+	 */
+	claudeDefaultEffort: z
+		.enum(["low", "medium", "high", "xhigh", "max"])
+		.optional(),
+
 	/** Default Gemini model to use across all repositories (e.g., "gemini-2.5-pro") */
 	geminiDefaultModel: z.string().optional(),
 

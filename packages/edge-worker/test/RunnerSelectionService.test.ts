@@ -32,6 +32,20 @@ describe("RunnerSelectionService", () => {
 		}
 	});
 
+	it("resolves claudeDefaultEffort for the Claude runner only", () => {
+		const service = new RunnerSelectionService({
+			claudeDefaultEffort: "medium",
+		} as EdgeWorkerConfig);
+
+		expect(service.getDefaultEffortForRunner("claude")).toBe("medium");
+		expect(service.getDefaultEffortForRunner("codex")).toBeUndefined();
+		expect(
+			new RunnerSelectionService(
+				{} as EdgeWorkerConfig,
+			).getDefaultEffortForRunner("claude"),
+		).toBeUndefined();
+	});
+
 	it("does not auto-detect OpenCode from an API key because OpenCode auth is CLI-managed", () => {
 		process.env.OPENCODE_API_KEY = "not-used-by-opencode";
 

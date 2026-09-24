@@ -546,6 +546,10 @@
 		"claudeDefaultFallbackModel": {
 			"type": "string"
 		},
+		"claudeDefaultEffort": {
+			"type": "string",
+			"enum": ["low", "medium", "high", "xhigh", "max"]
+		},
 		"geminiDefaultModel": {
 			"type": "string"
 		},

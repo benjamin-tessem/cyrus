@@ -142,6 +142,29 @@ describe("ClaudeRunner", () => {
 			});
 		});
 
+		it("passes effort to the SDK only when configured", async () => {
+			mockQuery.mockImplementation(async function* () {
+				yield {
+					type: "assistant",
+					message: { content: [{ type: "text", text: "Hello!" }] },
+					parent_tool_use_id: null,
+					session_id: "test-session",
+				} as any;
+			});
+
+			await new ClaudeRunner({ ...defaultConfig, effort: "medium" }).start(
+				"test",
+			);
+			expect(mockQuery.mock.calls.at(-1)?.[0].options).toMatchObject({
+				effort: "medium",
+			});
+
+			await new ClaudeRunner(defaultConfig).start("test");
+			expect(mockQuery.mock.calls.at(-1)?.[0].options).not.toHaveProperty(
+				"effort",
+			);
+		});
+
 		it("should allow ambient MCP configuration when strict mode is disabled", async () => {
 			const nonStrictRunner = new ClaudeRunner({
 				...defaultConfig,
