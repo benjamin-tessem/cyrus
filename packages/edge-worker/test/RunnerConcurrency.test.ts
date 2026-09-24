@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	capRunnerStarts,
 	carryIntoPendingStart,
+	type QueuedWaiter,
 	RunnerStartCancelledError,
 	SessionSemaphore,
 	takePendingStartPrompt,
@@ -502,3 +503,78 @@ function carriedPrompt(
 ): boolean {
 	return carried !== undefined && carryIntoPendingStart(runner, carried);
 }
+
+describe("SessionSemaphore queue positions", () => {
+	it("reports a waiter's live place in line, priority first", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+		const waiters: Record<string, QueuedWaiter> = {};
+		const normal = semaphore.acquire(false, undefined, (w) => {
+			waiters.normal = w;
+		});
+		const followUp = semaphore.acquire(true, undefined, (w) => {
+			waiters.followUp = w;
+		});
+
+		expect(waiters.followUp!.position()).toBe(1);
+		expect(waiters.normal!.position()).toBe(2);
+
+		semaphore.release();
+		await followUp;
+		expect(waiters.followUp!.position()).toBeUndefined();
+		expect(waiters.normal!.position()).toBe(1);
+
+		semaphore.release();
+		await normal;
+		expect(waiters.normal!.position()).toBeUndefined();
+	});
+
+	it("doesn't call onQueued when a slot is free", async () => {
+		const semaphore = new SessionSemaphore(1);
+		const onQueued = vi.fn();
+		await semaphore.acquire(false, undefined, onQueued);
+		expect(onQueued).not.toHaveBeenCalled();
+	});
+});
+
+describe("capRunnerStarts observer", () => {
+	it("reports queued, started and finished in order", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+		const events: string[] = [];
+		const { runner, startGate } = fakeRunner(false);
+		const gated = capRunnerStarts(runner, semaphore, false, {
+			queued: (w) => events.push(`queued@${w.position()}`),
+			started: () => events.push("started"),
+			withdrawn: () => events.push("withdrawn"),
+			finished: () => events.push("finished"),
+		});
+
+		const done = gated.start("go");
+		expect(events).toEqual(["queued@1"]);
+		semaphore.release();
+		await settled();
+		expect(events).toEqual(["queued@1", "started"]);
+		startGate.resolve(sessionInfo("x"));
+		await done;
+		expect(events).toEqual(["queued@1", "started", "finished"]);
+	});
+
+	it("reports withdrawn when stopped while queued, and survives a throwing observer", async () => {
+		const semaphore = new SessionSemaphore(1);
+		await semaphore.acquire();
+		const withdrawn = vi.fn();
+		const { runner } = fakeRunner(false);
+		const gated = capRunnerStarts(runner, semaphore, false, {
+			queued: () => {
+				throw new Error("observer bug");
+			},
+			withdrawn,
+		});
+
+		const start = gated.start("go");
+		gated.stop();
+		await expect(start).rejects.toBeInstanceOf(RunnerStartCancelledError);
+		expect(withdrawn).toHaveBeenCalledTimes(1);
+	});
+});

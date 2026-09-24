@@ -17,6 +17,16 @@ interface Waiter {
 	priority: boolean;
 }
 
+/** A queued acquire()'s view of its place in line. */
+export interface QueuedWaiter {
+	readonly priority: boolean;
+	/**
+	 * 1-based place in line (1 = admitted next), read live as the queue
+	 * moves. Undefined once admitted or withdrawn.
+	 */
+	position(): number | undefined;
+}
+
 /**
  * Counting semaphore with FIFO waiters and a live-adjustable limit.
  *
@@ -60,8 +70,15 @@ export class SessionSemaphore {
 	 * waiting withdraws from the queue and rejects with the signal's reason;
 	 * the active count is untouched. Once admitted, aborting has no effect —
 	 * the caller owns the slot and must release() it.
+	 *
+	 * `onQueued` is called (synchronously) only when the acquire has to wait,
+	 * with a handle for reading its place in line while it waits.
 	 */
-	acquire(priority = false, signal?: AbortSignal): Promise<void> {
+	acquire(
+		priority = false,
+		signal?: AbortSignal,
+		onQueued?: (waiter: QueuedWaiter) => void,
+	): Promise<void> {
 		if (signal?.aborted) {
 			return Promise.reject(signal.reason);
 		}
@@ -96,6 +113,13 @@ export class SessionSemaphore {
 					`${this.waiters.length} waiting` +
 					(priority ? " (follow-up: queued ahead of new tickets)" : ""),
 			);
+			onQueued?.({
+				priority,
+				position: () => {
+					const index = this.waiters.indexOf(waiter);
+					return index === -1 ? undefined : index + 1;
+				},
+			});
 		});
 	}
 
@@ -168,6 +192,22 @@ interface StartControl {
 	/** Earlier undelivered messages to put ahead of this runner's prompt. */
 	carried: string[];
 	abort: AbortController;
+}
+
+/**
+ * Hooks into a gated runner's start lifecycle, e.g. to tell the session's
+ * issue tracker it is waiting for a slot. Each is optional; exceptions are
+ * swallowed so an observer can never break a runner start.
+ */
+export interface RunnerStartObserver {
+	/** start() has to wait for a slot. */
+	queued?(waiter: QueuedWaiter): void;
+	/** start() holds a slot; the session is about to run. */
+	started?(): void;
+	/** start() gave up its place without running (the runner was stopped). */
+	withdrawn?(): void;
+	/** The session ended and released its slot. */
+	finished?(): void;
 }
 
 const START_CONTROL = Symbol("cyrus.startControl");
@@ -261,11 +301,13 @@ function withCarried(carried: string[], prompt?: string): string | undefined {
  * and the original methods stay observable (e.g. as test spies).
  *
  * `priority` marks a follow-up on existing work; see {@link SessionSemaphore}.
+ * `observer` hears about the start's queueing and slot lifecycle.
  */
 export function capRunnerStarts(
 	runner: IAgentRunner,
 	semaphore: SessionSemaphore,
 	priority = false,
+	observer?: RunnerStartObserver,
 ): IAgentRunner {
 	const control: StartControl = {
 		stage: "idle",
@@ -280,6 +322,15 @@ export function capRunnerStarts(
 		return new RunnerStartCancelledError(untaken);
 	};
 
+	const notify = (call: (observer: RunnerStartObserver) => void) => {
+		if (!observer) return;
+		try {
+			call(observer);
+		} catch {
+			// An observer must never break a runner start.
+		}
+	};
+
 	const gate = async <T>(
 		prompt: string | undefined,
 		run: (prompt: string | undefined) => Promise<T>,
@@ -290,8 +341,11 @@ export function capRunnerStarts(
 		control.stage = "queued";
 		control.prompt = prompt;
 		try {
-			await semaphore.acquire(priority, control.abort.signal);
+			await semaphore.acquire(priority, control.abort.signal, (waiter) =>
+				notify((o) => o.queued?.(waiter)),
+			);
 		} catch (error) {
+			notify((o) => o.withdrawn?.());
 			if (control.abort.signal.aborted) throw cancelled(prompt);
 			throw error;
 		}
@@ -299,15 +353,18 @@ export function capRunnerStarts(
 		// slot the session will never use.
 		if (control.abort.signal.aborted) {
 			semaphore.release();
+			notify((o) => o.withdrawn?.());
 			throw cancelled(prompt);
 		}
 		control.stage = "running";
+		notify((o) => o.started?.());
 		try {
 			return await run(withCarried(control.carried, prompt));
 		} finally {
 			control.stage = "done";
 			control.carried = [];
 			semaphore.release();
+			notify((o) => o.finished?.());
 		}
 	};
 

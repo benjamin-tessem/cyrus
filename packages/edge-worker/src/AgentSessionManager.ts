@@ -1801,6 +1801,19 @@ export class AgentSessionManager extends EventEmitter {
 	}
 
 	/**
+	 * Post an ephemeral thought saying the session is waiting for a concurrency
+	 * slot (see QueueNotice.ts). No-op for sessions without an external
+	 * session to post to; errors are logged, not thrown.
+	 */
+	async postQueuedNotice(sessionId: string, body: string): Promise<void> {
+		await this.postActivity(
+			sessionId,
+			{ content: { type: "thought", body }, ephemeral: true },
+			"queue notice",
+		);
+	}
+
+	/**
 	 * Handle status messages (compacting, etc.)
 	 */
 	private async handleStatusMessage(

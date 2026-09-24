@@ -172,6 +172,7 @@ import type {
 	PromptComponent,
 	PromptType,
 } from "./prompt-assembly/types.js";
+import { type QueueNoticeTarget, QueueNotifier } from "./QueueNotice.js";
 import {
 	RepositoryRouter,
 	type RepositoryRouterDeps,
@@ -271,6 +272,7 @@ export class EdgeWorker extends EventEmitter {
 	private runnerSelectionService: RunnerSelectionService;
 	/** Global cap on concurrently executing runner sessions (see maxConcurrentSessions). */
 	private runnerSlots: SessionSemaphore;
+	private queueNotifier: QueueNotifier;
 	private toolPermissionResolver: ToolPermissionResolver;
 	private mcpConfigService: McpConfigService;
 	private runnerConfigBuilder: RunnerConfigBuilder;
@@ -608,6 +610,7 @@ export class EdgeWorker extends EventEmitter {
 			this.config.maxConcurrentSessions ?? Number.POSITIVE_INFINITY,
 			(message) => this.logger.info(message),
 		);
+		this.queueNotifier = new QueueNotifier(this.runnerSlots, this.logger);
 		this.toolPermissionResolver = new ToolPermissionResolver(
 			this.config,
 			this.logger,
@@ -1911,7 +1914,9 @@ export class EdgeWorker extends EventEmitter {
 				}
 			};
 
-			runner = this.createRunnerForType(runnerType, runnerConfig, true);
+			runner = this.createRunnerForType(runnerType, runnerConfig, true, {
+				label: `${repoFullName}#${prNumber}`,
+			});
 
 			// Store the runner in the session manager
 			agentSessionManager.addAgentRunner(githubSessionId, runner);
@@ -2619,7 +2624,9 @@ ${taskSection}`;
 					"gitlab", // sessionPlatform → uses githubMcpConfigs override
 				);
 
-			const runner = this.createRunnerForType(runnerType, runnerConfig, true);
+			const runner = this.createRunnerForType(runnerType, runnerConfig, true, {
+				label: `${projectPath}!${mrIid}`,
+			});
 
 			// Store the runner in the session manager
 			agentSessionManager.addAgentRunner(gitlabSessionId, runner);
@@ -3004,6 +3011,7 @@ ${taskSection}`;
 	async stop(): Promise<void> {
 		// Stop config file watcher
 		await this.configManager.stop();
+		this.queueNotifier.stop();
 
 		// Follow-ups waiting for a slot live only in their runner; save them so
 		// the restart can deliver them (see RestartRecovery.ts).
@@ -5020,7 +5028,16 @@ ${taskSection}`;
 				`Label-based runner selection for new session: ${runnerType} (session ${sessionId})`,
 			);
 
-			const runner = this.createRunnerForType(runnerType, runnerConfig);
+			const runner = this.createRunnerForType(
+				runnerType,
+				runnerConfig,
+				false,
+				this.linearQueueNotice(
+					agentSessionManager,
+					sessionId,
+					fullIssue.identifier,
+				),
+			);
 
 			// Store runner by comment ID
 			agentSessionManager.addAgentRunner(sessionId, runner);
@@ -5807,17 +5824,35 @@ ${taskSection}`;
 	 * `priority` marks a follow-up on existing work (a Linear reply, a
 	 * GitHub/GitLab review or comment); it queues ahead of new tickets when
 	 * every slot is taken.
+	 *
+	 * `queueNotice` ties the runner to its session for queue notices: while
+	 * it waits for a slot the session is told its place in line, and while it
+	 * runs it is named in other sessions' notices (see QueueNotice.ts).
 	 */
 	private createRunnerForType(
 		runnerType: RunnerType,
 		config: AgentRunnerConfig,
 		priority = false,
+		queueNotice?: QueueNoticeTarget,
 	): IAgentRunner {
 		return capRunnerStarts(
 			this.buildRunnerForType(runnerType, config),
 			this.runnerSlots,
 			priority,
+			queueNotice ? this.queueNotifier.observe(queueNotice) : undefined,
 		);
+	}
+
+	/** Queue notices for a Linear agent session, posted as ephemeral thoughts. */
+	private linearQueueNotice(
+		agentSessionManager: AgentSessionManager,
+		sessionId: string,
+		issueIdentifier: string | undefined,
+	): QueueNoticeTarget {
+		return {
+			label: issueIdentifier,
+			post: (body) => agentSessionManager.postQueuedNotice(sessionId, body),
+		};
 	}
 
 	private buildRunnerForType(
@@ -7934,7 +7969,16 @@ ${input.userComment}
 			);
 
 		// Create the appropriate runner based on session state
-		const runner = this.createRunnerForType(runnerType, runnerConfig, true);
+		const runner = this.createRunnerForType(
+			runnerType,
+			runnerConfig,
+			true,
+			this.linearQueueNotice(
+				agentSessionManager,
+				sessionId,
+				fullIssue.identifier,
+			),
+		);
 		if (carriedPrompt) {
 			carryIntoPendingStart(runner, carriedPrompt);
 		}
