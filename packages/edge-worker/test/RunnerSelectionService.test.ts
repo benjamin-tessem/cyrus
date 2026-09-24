@@ -32,6 +32,41 @@ describe("RunnerSelectionService", () => {
 		}
 	});
 
+	it("takes a per-ticket effort from an Effort label or an [effort=] tag", () => {
+		const service = new RunnerSelectionService({
+			defaultRunner: "claude",
+			claudeDefaultEffort: "medium",
+		} as EdgeWorkerConfig);
+
+		expect(
+			service.determineRunnerSelection(["Feature", "opus", "high"])
+				.effortOverride,
+		).toBe("high");
+		// The description tag beats the label, and matching ignores case.
+		expect(
+			service.determineRunnerSelection(["high"], "Do it [effort=XHIGH]")
+				.effortOverride,
+		).toBe("xhigh");
+		// No label or tag: no override, so the config default applies.
+		expect(
+			service.determineRunnerSelection(["Feature"]).effortOverride,
+		).toBeUndefined();
+		// Unknown values are ignored.
+		expect(
+			service.determineRunnerSelection([], "[effort=turbo]").effortOverride,
+		).toBeUndefined();
+	});
+
+	it("ignores effort labels when the ticket runs on a non-Claude runner", () => {
+		const service = new RunnerSelectionService({
+			defaultRunner: "claude",
+		} as EdgeWorkerConfig);
+
+		const selection = service.determineRunnerSelection(["gpt-5.6-sol", "high"]);
+		expect(selection.runnerType).toBe("codex");
+		expect(selection.effortOverride).toBeUndefined();
+	});
+
 	it("resolves claudeDefaultEffort for the Claude runner only", () => {
 		const service = new RunnerSelectionService({
 			claudeDefaultEffort: "medium",

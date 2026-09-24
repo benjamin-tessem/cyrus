@@ -134,6 +134,7 @@ export class RunnerSelectionService {
 	 * Supported description tags:
 	 * - [agent=claude|gemini|codex|cursor|opencode]
 	 * - [model=<model-name>]
+	 * - [effort=low|medium|high|xhigh|max] (Claude runner only)
 	 *
 	 * Supported Linear label selectors:
 	 * - <provider>/<model>, where provider is claude, gemini, codex, cursor, or openai
@@ -145,6 +146,10 @@ export class RunnerSelectionService {
 	 * 3. Agent labels override model labels
 	 * 4. Model labels can infer agent type
 	 * 5. Defaults to configured/default runner
+	 *
+	 * Effort: an [effort=...] tag, else a label named after an effort level
+	 * (e.g. in a Linear "Effort" label group), else claudeDefaultEffort.
+	 * Only returned when the runner is Claude.
 	 */
 	public determineRunnerSelection(
 		labels: string[],
@@ -153,6 +158,7 @@ export class RunnerSelectionService {
 		runnerType: RunnerType;
 		modelOverride?: string;
 		fallbackModelOverride?: string;
+		effortOverride?: ClaudeEffort;
 	} {
 		const normalizedLabels = (labels || []).map((label) => label.toLowerCase());
 		const normalizedDescription = issueDescription || "";
@@ -388,10 +394,37 @@ export class RunnerSelectionService {
 			fallbackModelOverride = defaultFallbackByRunner[runnerType];
 		}
 
+		const effortFromDescription = asEffort(
+			this.parseDescriptionTag(normalizedDescription, "effort"),
+		);
+		const effortFromLabels = normalizedLabels
+			.map(asEffort)
+			.find((effort) => effort !== undefined);
+		const effortOverride =
+			runnerType === "claude"
+				? (effortFromDescription ?? effortFromLabels)
+				: undefined;
+
 		return {
 			runnerType,
 			modelOverride: resolvedModelOverride,
 			fallbackModelOverride,
+			...(effortOverride && { effortOverride }),
 		};
 	}
+}
+
+type ClaudeEffort = NonNullable<EdgeWorkerConfig["claudeDefaultEffort"]>;
+
+const EFFORT_LEVELS: readonly ClaudeEffort[] = [
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+
+function asEffort(value: string | undefined): ClaudeEffort | undefined {
+	const normalized = value?.toLowerCase();
+	return EFFORT_LEVELS.find((level) => level === normalized);
 }

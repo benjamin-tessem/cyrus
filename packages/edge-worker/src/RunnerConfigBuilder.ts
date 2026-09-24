@@ -62,6 +62,7 @@ export interface IRunnerSelector {
 		runnerType: RunnerType;
 		modelOverride?: string;
 		fallbackModelOverride?: string;
+		effortOverride?: AgentRunnerConfig["effort"];
 	};
 	getDefaultModelForRunner(runnerType: RunnerType): string | undefined;
 	getDefaultFallbackModelForRunner(runnerType: RunnerType): string | undefined;
@@ -423,7 +424,12 @@ export class RunnerConfigBuilder {
 			input.repository.model ||
 			this.runnerSelector.getDefaultModelForRunner(runnerType);
 
-		const effort = this.runnerSelector.getDefaultEffortForRunner?.(runnerType);
+		// A per-ticket effort (label or [effort=] tag) wins over the default,
+		// but only while the session is still on Claude: the resume path above
+		// can switch runners.
+		const effort =
+			(runnerType === "claude" ? runnerSelection.effortOverride : undefined) ??
+			this.runnerSelector.getDefaultEffortForRunner?.(runnerType);
 
 		const resolvedWorkspaceId =
 			input.linearWorkspaceId ??
