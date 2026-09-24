@@ -159,8 +159,8 @@ Build the payment integration
 
 		// Check for label-based (builder) prompt content
 		expect(result.systemPrompt).toContain("builder");
-		expect(result.systemPrompt).toContain("Task tool");
-		expect(result.systemPrompt).toContain("<builder_specific_instructions>");
+		expect(result.systemPrompt).toContain("<what_to_follow>");
+		expect(result.systemPrompt).toContain("The Linear issue.");
 
 		// Verify todolist-system-prompt-extension instructions are NOT included in label-based prompts
 		// Check for unique content from todolist-system-prompt-extension that won't be in builder prompt
