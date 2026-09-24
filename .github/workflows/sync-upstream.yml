@@ -108,14 +108,38 @@ jobs:
           { pnpm biome ci && pnpm build && pnpm typecheck && pnpm -r test:run; } 2>&1 \
             | tee "$RUNNER_TEMP/checks.log"
 
-      - name: Push to main
+      # The Nix package pins a hash of the pnpm dependencies (nix/package.nix).
+      # When the merge changed pnpm-lock.yaml that hash is stale: take the
+      # correct one from the build error, commit it, and build again.
+      - uses: cachix/install-nix-action@v31
         if: steps.merge.outputs.conflict == 'false' && steps.checks.outcome == 'success'
+
+      - name: Nix package
+        id: nix
+        if: steps.merge.outputs.conflict == 'false' && steps.checks.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          build() { nix build --no-link -L .#cyrus 2>&1 | tee "$RUNNER_TEMP/nix.log"; }
+          if ! build; then
+            got=$(grep -oP 'got:\s+\Ksha256-\S+' "$RUNNER_TEMP/nix.log" | head -1)
+            [ -n "$got" ] || exit 1
+            sed -i -E "s#hash = \"sha256-[^\"]+\";#hash = \"$got\";#" nix/package.nix
+            git commit -qam "chore(nix): update pnpm dependency hash for ${{ steps.tag.outputs.tag }}"
+            build
+          fi
+
+      - name: Push to main
+        if: >-
+          steps.merge.outputs.conflict == 'false' && steps.checks.outcome == 'success' &&
+          steps.nix.outcome == 'success'
         run: git push origin HEAD:main
 
       - name: Open a pull request instead
         if: >-
           steps.merge.outputs.conflict == 'true' ||
-          (steps.merge.outputs.conflict == 'false' && steps.checks.outcome != 'success')
+          (steps.merge.outputs.conflict == 'false' &&
+           (steps.checks.outcome != 'success' || steps.nix.outcome != 'success'))
         run: |
           tag="${{ steps.tag.outputs.tag }}"
           if [ "${{ steps.merge.outputs.conflict }}" = true ]; then
@@ -133,10 +157,10 @@ jobs:
           else
             git push --force origin "HEAD:refs/heads/sync/$tag"
             {
-              echo "Upstream $tag merges cleanly, but the checks fail on the result. Last lines:"
+              echo "Upstream $tag merges cleanly, but the checks or the Nix build fail on the result. Last lines:"
               echo
               echo '```'
-              tail -60 "$RUNNER_TEMP/checks.log"
+              tail -60 "$RUNNER_TEMP/nix.log" 2>/dev/null || tail -60 "$RUNNER_TEMP/checks.log"
               echo '```'
             } > "$RUNNER_TEMP/body.md"
           fi
