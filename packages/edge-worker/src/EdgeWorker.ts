@@ -176,9 +176,11 @@ import {
 	RepositoryRouter,
 	type RepositoryRouterDeps,
 } from "./RepositoryRouter.js";
+import { planRestartRecovery } from "./RestartRecovery.js";
 import {
 	capRunnerStarts,
 	carryIntoPendingStart,
+	peekQueuedStartPrompt,
 	RunnerStartCancelledError,
 	SessionSemaphore,
 	takePendingStartPrompt,
@@ -306,6 +308,13 @@ export class EdgeWorker extends EventEmitter {
 	 * Key format: `${createdAt}:${issueId}`
 	 */
 	private processedIssueUpdateKeys = new Set<string>();
+
+	/**
+	 * Follow-ups that were waiting for a concurrency slot at shutdown, by
+	 * agent session id. Filled by stop() and by loading saved state; drained
+	 * by recoverAfterRestart(). See RestartRecovery.ts.
+	 */
+	private pendingRestartPrompts: Record<string, string> = {};
 
 	/**
 	 * Sessions parked due to blocked-by dependencies.
@@ -774,6 +783,137 @@ export class EdgeWorker extends EventEmitter {
 
 		// Start shared application server (this also starts Cloudflare tunnel if CLOUDFLARE_TOKEN is set)
 		await this.sharedApplicationServer.start();
+
+		// Bring back sessions the previous process left unfinished. Not
+		// awaited: each one queues for a runner slot like any other session.
+		this.recoverAfterRestart().catch((error) => {
+			this.logger.error(
+				"Restart recovery failed",
+				error instanceof Error ? error : new Error(String(error)),
+			);
+		});
+	}
+
+	/**
+	 * Resume or restart every session a previous process left unfinished:
+	 * runs it interrupted, tickets still queued for their first run, and
+	 * follow-ups still queued at shutdown. Replays each through the same
+	 * handler a Linear webhook would reach. See RestartRecovery.ts.
+	 */
+	private async recoverAfterRestart(): Promise<void> {
+		const actions = planRestartRecovery(
+			this.agentSessionManager.getAllSessions(),
+			this.pendingRestartPrompts,
+		);
+		this.pendingRestartPrompts = {};
+		if (actions.length === 0) return;
+		await this.savePersistedState();
+		this.logger.info(
+			`Restart recovery: ${actions.length} session(s) to bring back`,
+		);
+
+		for (const action of actions) {
+			const repoId = this.sessionRepositories.get(action.sessionId);
+			const cachedRepos = this.getCachedRepositories(action.issue.id);
+			const repository =
+				(repoId ? this.repositories.get(repoId) : undefined) ??
+				cachedRepos?.[0];
+			const linearWorkspaceId = repository?.linearWorkspaceId;
+			if (!linearWorkspaceId) {
+				this.logger.warn(
+					`Restart recovery: no Linear workspace for ${action.issue.identifier}; skipping`,
+				);
+				continue;
+			}
+			const createdAt = new Date().toISOString();
+			try {
+				if (action.kind === "prompt") {
+					await this.handleUserPromptedAgentActivity({
+						type: "AgentSessionEvent",
+						action: "prompted",
+						organizationId: linearWorkspaceId,
+						createdAt,
+						agentSession: { id: action.sessionId, issue: action.issue },
+						agentActivity: {
+							content: { type: "prompt", body: action.prompt },
+						},
+					} as unknown as AgentSessionPromptedWebhook);
+					this.logger.info(
+						`Restart recovery: resumed ${action.issue.identifier}`,
+					);
+				} else {
+					const agentSession = await this.fetchAgentSessionForReplay(
+						action.sessionId,
+						action.issue,
+						linearWorkspaceId,
+					);
+					const repos = Array.from(this.repositories.values()).filter(
+						(repo) => repo.linearWorkspaceId === linearWorkspaceId,
+					);
+					await this.handleAgentSessionCreatedWebhook(
+						{
+							type: "AgentSessionEvent",
+							action: "created",
+							organizationId: linearWorkspaceId,
+							createdAt,
+							agentSession,
+						} as unknown as AgentSessionCreatedWebhook,
+						repos,
+					);
+					this.logger.info(
+						`Restart recovery: restarted ${action.issue.identifier}, which had not started yet`,
+					);
+				}
+			} catch (error) {
+				this.logger.error(
+					`Restart recovery failed for ${action.issue.identifier}`,
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			}
+		}
+	}
+
+	/**
+	 * Rebuild the agentSession part of a "created" webhook from Linear, so a
+	 * session that never started can be replayed from scratch. The comment
+	 * matters: it is how the created handler tells an @mention (whose text is
+	 * the request) from a delegation.
+	 */
+	private async fetchAgentSessionForReplay(
+		sessionId: string,
+		issue: { id: string; identifier: string; title: string },
+		linearWorkspaceId: string,
+	): Promise<AgentSessionCreatedWebhook["agentSession"]> {
+		const replay: Record<string, unknown> = { id: sessionId, issue };
+		const tracker = this.getIssueTrackerForWorkspace(linearWorkspaceId);
+		if (!tracker) {
+			return replay as unknown as AgentSessionCreatedWebhook["agentSession"];
+		}
+		const [linearSession, fullIssue] = await Promise.all([
+			tracker.fetchAgentSession(sessionId).catch(() => undefined),
+			tracker.fetchIssue(issue.id).catch(() => undefined),
+		]);
+		if (fullIssue) {
+			const team = await fullIssue.team?.catch(() => undefined);
+			replay.issue = {
+				...issue,
+				description: fullIssue.description ?? undefined,
+				...(team ? { team: { key: team.key } } : {}),
+			};
+		}
+		const [comment, creator] = await Promise.all([
+			linearSession?.comment?.catch(() => undefined),
+			linearSession?.creator?.catch(() => undefined),
+		]);
+		if (comment) replay.comment = { id: comment.id, body: comment.body };
+		if (creator) {
+			replay.creator = {
+				id: creator.id,
+				name: creator.name,
+				email: creator.email,
+			};
+		}
+		return replay as unknown as AgentSessionCreatedWebhook["agentSession"];
 	}
 
 	/**
@@ -2864,6 +3004,17 @@ ${taskSection}`;
 	async stop(): Promise<void> {
 		// Stop config file watcher
 		await this.configManager.stop();
+
+		// Follow-ups waiting for a slot live only in their runner; save them so
+		// the restart can deliver them (see RestartRecovery.ts).
+		for (const session of this.agentSessionManager.getAllSessions()) {
+			const queued = session.agentRunner
+				? peekQueuedStartPrompt(session.agentRunner)
+				: undefined;
+			if (queued !== undefined) {
+				this.pendingRestartPrompts[session.id] = queued;
+			}
+		}
 
 		try {
 			await this.savePersistedState();
@@ -7336,6 +7487,9 @@ ${input.userComment}
 			childToParentAgentSession,
 			issueRepositoryCache,
 			parkedSessions,
+			...(Object.keys(this.pendingRestartPrompts).length > 0 && {
+				pendingRestartPrompts: { ...this.pendingRestartPrompts },
+			}),
 		};
 	}
 
@@ -7343,6 +7497,10 @@ ${input.userComment}
 	 * Restore EdgeWorker mappings from serialized state (v4.0 flat format)
 	 */
 	public restoreMappings(state: SerializableEdgeWorkerState): void {
+		if (state.pendingRestartPrompts) {
+			this.pendingRestartPrompts = { ...state.pendingRestartPrompts };
+		}
+
 		// Restore Agent Session state from flat format
 		if (state.agentSessions && state.agentSessionEntries) {
 			this.agentSessionManager.restoreState(

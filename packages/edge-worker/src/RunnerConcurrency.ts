@@ -201,6 +201,20 @@ export function takePendingStartPrompt(
 }
 
 /**
+ * The prompt a runner is still waiting for a slot to deliver, without taking
+ * it. Used at shutdown to save queued follow-ups so a restart can replay them.
+ */
+export function peekQueuedStartPrompt(
+	runner: IAgentRunner,
+): string | undefined {
+	const control = startControlOf(runner);
+	if (!control || control.stage !== "queued" || control.promptTaken) {
+		return undefined;
+	}
+	return withCarried(control.carried, control.prompt);
+}
+
+/**
  * Queue an earlier, undelivered message to go ahead of this runner's prompt
  * when it starts. Returns false if the runner has already started (use
  * addStreamMessage instead) or isn't a gated runner.

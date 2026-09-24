@@ -89,6 +89,10 @@ export interface SerializableEdgeWorkerState {
 	// Sessions parked on blocked-by dependencies, keyed by blocked issue id.
 	// Optional and additive: state files written before this field load unchanged.
 	parkedSessions?: Record<string, SerializedParkedSession>;
+	// Follow-ups still waiting for a concurrency slot when Cyrus stopped,
+	// keyed by agent session id, so the restart can deliver them. Written
+	// on shutdown and cleared once they are replayed.
+	pendingRestartPrompts?: Record<string, string>;
 }
 
 /**
