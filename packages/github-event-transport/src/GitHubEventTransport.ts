@@ -5,6 +5,7 @@ import { createLogger, type ILogger, ipMatchesAllowlist } from "cyrus-core";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { GitHubMessageTranslator } from "./GitHubMessageTranslator.js";
 import type {
+	GitHubCheckSuitePayload,
 	GitHubEventTransportConfig,
 	GitHubEventTransportEvents,
 	GitHubEventType,
@@ -43,6 +44,8 @@ export declare interface GitHubEventTransport {
  * - pull_request_review_comment: Inline review comments on PR diffs
  * - pull_request_review: PR review submissions (e.g., changes_requested)
  * - push: Branch push events (used for base branch change notifications)
+ * - check_suite (completed): CI finished for a commit (used to tell the
+ *   agent that owns the branch when its PR's checks fail)
  */
 export class GitHubEventTransport extends EventEmitter {
 	private config: GitHubEventTransportConfig;
@@ -243,7 +246,8 @@ export class GitHubEventTransport extends EventEmitter {
 			eventType !== "issue_comment" &&
 			eventType !== "pull_request_review_comment" &&
 			eventType !== "pull_request_review" &&
-			eventType !== "push"
+			eventType !== "push" &&
+			eventType !== "check_suite"
 		) {
 			this.logger.debug(`Ignoring unsupported event type: ${eventType}`);
 			reply.code(200).send({ success: true, ignored: true });
@@ -254,11 +258,21 @@ export class GitHubEventTransport extends EventEmitter {
 			| GitHubIssueCommentPayload
 			| GitHubPullRequestReviewCommentPayload
 			| GitHubPullRequestReviewPayload
-			| GitHubPushPayload;
+			| GitHubPushPayload
+			| GitHubCheckSuitePayload;
 
 		// Push events don't have an action field — always emit them
 		if (eventType === "push") {
 			// No action filtering needed for push events
+		} else if (eventType === "check_suite") {
+			// Only a finished suite says anything about CI results
+			if ((payload as GitHubCheckSuitePayload).action !== "completed") {
+				this.logger.debug(
+					`Ignoring ${eventType} with action: ${(payload as GitHubCheckSuitePayload).action}`,
+				);
+				reply.code(200).send({ success: true, ignored: true });
+				return;
+			}
 		} else if (eventType === "pull_request_review") {
 			// For pull_request_review, handle 'submitted' action (not 'created')
 			if ((payload as GitHubPullRequestReviewPayload).action !== "submitted") {

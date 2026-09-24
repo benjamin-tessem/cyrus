@@ -51,7 +51,8 @@ export interface GitHubWebhookEvent {
 		| GitHubIssueCommentPayload
 		| GitHubPullRequestReviewCommentPayload
 		| GitHubPullRequestReviewPayload
-		| GitHubPushPayload;
+		| GitHubPushPayload
+		| GitHubCheckSuitePayload;
 	/** GitHub installation token forwarded from CYHOST (1-hour expiry) */
 	installationToken?: string;
 }
@@ -63,12 +64,16 @@ export type GitHubEventType =
 	| "issue_comment"
 	| "pull_request_review_comment"
 	| "pull_request_review"
-	| "push";
+	| "push"
+	| "check_suite";
 
 /**
- * Comment-related GitHub event types (excludes push)
+ * Comment-related GitHub event types (excludes push and check_suite)
  */
-export type GitHubCommentEventType = Exclude<GitHubEventType, "push">;
+export type GitHubCommentEventType = Exclude<
+	GitHubEventType,
+	"push" | "check_suite"
+>;
 
 /**
  * Comment/review webhook event (excludes push events).
@@ -281,6 +286,38 @@ export interface GitHubPushPayload {
 	head_commit: GitHubPushCommit | null;
 	repository: GitHubRepository;
 	pusher: { name: string; email: string };
+	sender: GitHubUser;
+	installation?: GitHubInstallation;
+}
+
+/**
+ * Pull request reference inside a check_suite payload (minimal)
+ */
+export interface GitHubCheckSuitePullRequest {
+	number: number;
+	head: { ref: string; sha: string };
+	base: { ref: string; sha: string };
+}
+
+/**
+ * Payload for check_suite webhook events. Only `completed` is forwarded:
+ * GitHub sends it to every App with Checks read access, for every app's
+ * suite (GitHub Actions creates one suite per workflow run).
+ * @see https://docs.github.com/en/webhooks/webhook-events-and-payloads#check_suite
+ */
+export interface GitHubCheckSuitePayload {
+	action: "completed" | "requested" | "rerequested";
+	check_suite: {
+		id: number;
+		head_branch: string | null;
+		head_sha: string;
+		status: string | null;
+		conclusion: string | null;
+		/** Open PRs whose head is this branch (empty for PRs from forks) */
+		pull_requests: GitHubCheckSuitePullRequest[];
+		app?: { slug?: string; name?: string };
+	};
+	repository: GitHubRepository;
 	sender: GitHubUser;
 	installation?: GitHubInstallation;
 }

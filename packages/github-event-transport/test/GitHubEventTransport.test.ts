@@ -438,6 +438,54 @@ describe("GitHubEventTransport", () => {
 			expect(eventListener).not.toHaveBeenCalled();
 		});
 
+		it("processes check_suite events with completed action", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{
+					action: "completed",
+					check_suite: { head_branch: "cyrus/def-1", head_sha: "abc" },
+				},
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "check_suite",
+					"x-github-delivery": "delivery-cs",
+				},
+			);
+			const reply = createMockReply();
+
+			await mockFastify.routes["/github-webhook"]!(request, reply);
+
+			expect(reply.send).toHaveBeenCalledWith({ success: true });
+			expect(eventListener).toHaveBeenCalledWith(
+				expect.objectContaining({
+					eventType: "check_suite",
+					deliveryId: "delivery-cs",
+				}),
+			);
+		});
+
+		it("ignores check_suite events that are not completed", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{ action: "requested", check_suite: {} },
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "check_suite",
+					"x-github-delivery": "delivery-cs",
+				},
+			);
+			const reply = createMockReply();
+
+			await mockFastify.routes["/github-webhook"]!(request, reply);
+
+			expect(reply.send).toHaveBeenCalledWith({ success: true, ignored: true });
+			expect(eventListener).not.toHaveBeenCalled();
+		});
+
 		it("extracts installation token from X-GitHub-Installation-Token header", async () => {
 			const eventListener = vi.fn();
 			transport.on("event", eventListener);

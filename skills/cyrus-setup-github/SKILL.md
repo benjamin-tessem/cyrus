@@ -7,7 +7,7 @@ description: Configure GitHub for Cyrus — gh CLI login and git config for PRs,
 
 # Setup GitHub
 
-Configures GitHub CLI and git so Cyrus can create branches, commits, and pull requests. Optionally creates a GitHub App so Cyrus can receive and respond to @mentions in PR comments and reviews, automate rebases and merges, and auto-fix based on CI failures (coming soon).
+Configures GitHub CLI and git so Cyrus can create branches, commits, and pull requests. Optionally creates a GitHub App so Cyrus can receive and respond to @mentions in PR comments and reviews, automate rebases and merges, and fix CI failures on the PRs it opened.
 
 ---
 
@@ -83,7 +83,7 @@ Ask the user:
 
 > **Do you want Cyrus to respond to GitHub @mentions in PR comments and reviews?**
 >
-> - **Yes — enable @mentions**: Creates a GitHub App so Cyrus can receive PR comments and reviews via webhooks, respond when @mentioned, and act on "changes requested" reviews.
+> - **Yes — enable @mentions**: Creates a GitHub App so Cyrus can receive PR comments and reviews via webhooks, respond when @mentioned, act on "changes requested" reviews, and fix CI failures on its own PRs.
 > - **No — PRs only**: Cyrus will create branches, commits, and PRs but won't respond to comments.
 
 If **No** → skip to Completion.
@@ -157,16 +157,22 @@ Construct the manifest, substituting `AGENT_NAME`, `HOMEPAGE_URL`, and `CYRUS_BA
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
-    "repository_hooks": "write"
+    "repository_hooks": "write",
+    "checks": "read",
+    "actions": "read",
+    "statuses": "read"
   },
   "default_events": [
     "issue_comment",
     "pull_request_review",
     "pull_request_review_comment",
-    "repository"
+    "repository",
+    "check_suite"
   ]
 }
 ```
+
+**CI failure notifications:** `check_suite` plus `checks: read` let Cyrus notice when every check on a PR it opened has finished and one failed, and prompt the agent that owns the branch to fix it (once per head commit). `statuses: read` includes legacy commit statuses in that verdict, and `actions: read` lets the agent read the failed run's logs with `gh run view --log-failed`. For an App created before this, add those permissions and the **Check suite** event under the App's *Permissions & events* settings, then accept the new permissions on the installation. Without Checks access Cyrus logs one warning and otherwise ignores CI.
 
 **Note:** `redirect_url` is required by GitHub's manifest flow. The actual redirect will include a `?code=` parameter appended to this URL — the code is what matters, not the destination page.
 

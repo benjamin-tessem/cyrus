@@ -93,6 +93,10 @@ export interface SerializableEdgeWorkerState {
 	// keyed by agent session id, so the restart can deliver them. Written
 	// on shutdown and cleared once they are replayed.
 	pendingRestartPrompts?: Record<string, string>;
+	// Head commit SHAs whose CI failure was already reported to the session
+	// that owns the PR, oldest first and capped, so a restart doesn't report
+	// them again.
+	ciFailureNotifiedShas?: string[];
 }
 
 /**

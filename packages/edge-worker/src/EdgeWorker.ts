@@ -98,6 +98,7 @@ import {
 	extractRepoOwner,
 	extractSessionKey,
 	GitHubAppTokenProvider,
+	type GitHubCheckSuitePayload,
 	GitHubCommentService,
 	type GitHubCommentWebhookEvent,
 	GitHubEventTransport,
@@ -158,6 +159,14 @@ import type { ChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import { LiveChatRepositoryProvider } from "./ChatRepositoryProvider.js";
 import type { ChatSessionHandlerDeps } from "./ChatSessionHandler.js";
 import { ChatSessionHandler } from "./ChatSessionHandler.js";
+import {
+	type CheckRunSummary,
+	type CommitStatusSummary,
+	ciFailurePrompt,
+	evaluateCiState,
+	findSessionForBranch,
+	NotifiedShaSet,
+} from "./CiFailureNotifier.js";
 import { ConfigManager, type RepositoryChanges } from "./ConfigManager.js";
 import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
@@ -317,6 +326,15 @@ export class EdgeWorker extends EventEmitter {
 	 * by recoverAfterRestart(). See RestartRecovery.ts.
 	 */
 	private pendingRestartPrompts: Record<string, string> = {};
+
+	/**
+	 * Head commits whose CI failure was already reported to their session,
+	 * so each commit is reported once, across restarts too. See
+	 * CiFailureNotifier.ts.
+	 */
+	private ciFailureNotifiedShas = new NotifiedShaSet();
+	/** Missing GitHub App permissions already warned about, by API. */
+	private ciPermissionWarnings = new Set<string>();
 
 	/**
 	 * Sessions parked due to blocked-by dependencies.
@@ -816,12 +834,10 @@ export class EdgeWorker extends EventEmitter {
 		);
 
 		for (const action of actions) {
-			const repoId = this.sessionRepositories.get(action.sessionId);
-			const cachedRepos = this.getCachedRepositories(action.issue.id);
-			const repository =
-				(repoId ? this.repositories.get(repoId) : undefined) ??
-				cachedRepos?.[0];
-			const linearWorkspaceId = repository?.linearWorkspaceId;
+			const linearWorkspaceId = this.linearWorkspaceForSession(
+				action.sessionId,
+				action.issue.id,
+			);
 			if (!linearWorkspaceId) {
 				this.logger.warn(
 					`Restart recovery: no Linear workspace for ${action.issue.identifier}; skipping`,
@@ -831,16 +847,12 @@ export class EdgeWorker extends EventEmitter {
 			const createdAt = new Date().toISOString();
 			try {
 				if (action.kind === "prompt") {
-					await this.handleUserPromptedAgentActivity({
-						type: "AgentSessionEvent",
-						action: "prompted",
-						organizationId: linearWorkspaceId,
-						createdAt,
-						agentSession: { id: action.sessionId, issue: action.issue },
-						agentActivity: {
-							content: { type: "prompt", body: action.prompt },
-						},
-					} as unknown as AgentSessionPromptedWebhook);
+					await this.promptSessionInternally(
+						action.sessionId,
+						action.issue,
+						linearWorkspaceId,
+						action.prompt,
+					);
 					this.logger.info(
 						`Restart recovery: resumed ${action.issue.identifier}`,
 					);
@@ -874,6 +886,43 @@ export class EdgeWorker extends EventEmitter {
 				);
 			}
 		}
+	}
+
+	/**
+	 * Deliver a message to a Linear session as if the user had replied to it
+	 * in Linear: same handler, same resume path, and the resumed runner
+	 * queues ahead of new tickets.
+	 */
+	private async promptSessionInternally(
+		sessionId: string,
+		issue: { id: string; identifier: string; title: string },
+		linearWorkspaceId: string,
+		body: string,
+	): Promise<void> {
+		await this.handleUserPromptedAgentActivity({
+			type: "AgentSessionEvent",
+			action: "prompted",
+			organizationId: linearWorkspaceId,
+			createdAt: new Date().toISOString(),
+			agentSession: { id: sessionId, issue },
+			agentActivity: {
+				content: { type: "prompt", body },
+			},
+		} as unknown as AgentSessionPromptedWebhook);
+	}
+
+	/**
+	 * The Linear workspace a session belongs to, via its repository.
+	 */
+	private linearWorkspaceForSession(
+		sessionId: string,
+		issueId: string,
+	): string | undefined {
+		const repoId = this.sessionRepositories.get(sessionId);
+		const repository =
+			(repoId ? this.repositories.get(repoId) : undefined) ??
+			this.getCachedRepositories(issueId)?.[0];
+		return repository?.linearWorkspaceId;
 	}
 
 	/**
@@ -1147,6 +1196,15 @@ export class EdgeWorker extends EventEmitter {
 						);
 					},
 				);
+				return;
+			}
+			if (event.eventType === "check_suite") {
+				this.handleGitHubCheckSuiteWebhook(event).catch((error) => {
+					this.logger.error(
+						"Failed to handle GitHub check_suite webhook",
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
 				return;
 			}
 			this.handleGitHubWebhook(event as GitHubCommentWebhookEvent).catch(
@@ -2090,6 +2148,239 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 				}
 			}
 		}
+	}
+
+	/**
+	 * Handle a finished GitHub check suite. When the branch belongs to a
+	 * Cyrus session, every check on the PR's head commit has finished and at
+	 * least one failed, prompt that session to fix it, once per head commit.
+	 * Everything else is ignored quietly. See CiFailureNotifier.ts.
+	 */
+	private async handleGitHubCheckSuiteWebhook(
+		event: GitHubWebhookEvent,
+	): Promise<void> {
+		const payload = event.payload as GitHubCheckSuitePayload;
+		const headBranch = payload.check_suite?.head_branch;
+		const headSha = payload.check_suite?.head_sha;
+		const repoFullName = payload.repository?.full_name;
+		if (!headBranch || !headSha || !repoFullName) return;
+		if (this.ciFailureNotifiedShas.has(headSha)) return;
+
+		const repository = this.findRepositoryByGitHubUrl(repoFullName);
+		if (!repository) return;
+
+		const session = findSessionForBranch(
+			this.agentSessionManager.getAllSessions(),
+			headBranch,
+			repository.id,
+			(sessionId) => this.sessionRepositories.get(sessionId),
+		);
+		if (!session?.issue) {
+			this.logger.debug(
+				`check_suite on ${repoFullName}@${headBranch}: no Cyrus session owns this branch`,
+			);
+			return;
+		}
+
+		const token = await this.resolveGitHubToken(event, repository);
+		const pr = await this.findOpenPullRequestForBranch(
+			payload,
+			repoFullName,
+			headBranch,
+			token,
+		);
+		if (!pr) {
+			this.logger.debug(
+				`check_suite on ${repoFullName}@${headBranch}: no open pull request`,
+			);
+			return;
+		}
+		if (pr.headSha && pr.headSha !== headSha) {
+			// The branch moved on; that newer commit gets its own suites.
+			return;
+		}
+
+		const ci = await this.fetchCommitCiState(repoFullName, headSha, token);
+		if (!ci) return;
+		const verdict = evaluateCiState(ci.checkRuns, ci.statuses);
+		if (verdict.kind !== "failed") {
+			this.logger.debug(
+				`CI on ${repoFullName}#${pr.number} (${headSha.slice(0, 7)}): ${verdict.kind}`,
+			);
+			return;
+		}
+		// Re-check after the awaits: another suite may have got here first.
+		if (this.ciFailureNotifiedShas.has(headSha)) return;
+
+		const linearWorkspaceId = this.linearWorkspaceForSession(
+			session.id,
+			session.issue.id,
+		);
+		if (!linearWorkspaceId) {
+			this.logger.warn(
+				`CI failed on ${repoFullName}#${pr.number} but ${session.issue.identifier} has no Linear workspace; not notifying`,
+			);
+			return;
+		}
+
+		this.ciFailureNotifiedShas.add(headSha);
+		await this.savePersistedState();
+		this.logger.info(
+			`CI failed on ${repoFullName}#${pr.number} (${headSha.slice(0, 7)}): ${verdict.failingChecks.join(", ")} — prompting ${session.issue.identifier}`,
+		);
+		try {
+			await this.promptSessionInternally(
+				session.id,
+				{
+					id: session.issue.id,
+					identifier: session.issue.identifier,
+					title: session.issue.title,
+				},
+				linearWorkspaceId,
+				ciFailurePrompt(pr.number, headSha, verdict.failingChecks),
+			);
+		} catch (error) {
+			// Let the next finished suite for this commit try again.
+			this.ciFailureNotifiedShas.delete(headSha);
+			await this.savePersistedState();
+			throw error;
+		}
+	}
+
+	/**
+	 * The open PR whose head is `branch`: from the webhook when GitHub
+	 * included it, otherwise looked up by head branch.
+	 */
+	private async findOpenPullRequestForBranch(
+		payload: GitHubCheckSuitePayload,
+		repoFullName: string,
+		branch: string,
+		token: string | undefined,
+	): Promise<{ number: number; headSha?: string } | null> {
+		const fromPayload = (payload.check_suite.pull_requests ?? []).find(
+			(pr) => pr.head?.ref === branch,
+		);
+		if (fromPayload) {
+			return { number: fromPayload.number, headSha: fromPayload.head.sha };
+		}
+		const owner = repoFullName.split("/")[0];
+		const response = await this.githubApiGet(
+			`/repos/${repoFullName}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
+			token,
+		);
+		if (!response?.ok) return null;
+		const pulls = (await response.json()) as Array<{
+			number: number;
+			head?: { sha?: string };
+		}>;
+		const pr = pulls[0];
+		return pr ? { number: pr.number, headSha: pr.head?.sha } : null;
+	}
+
+	/**
+	 * Every check run and commit status on a commit. Null when the check
+	 * runs can't be read (the verdict would be meaningless without them).
+	 */
+	private async fetchCommitCiState(
+		repoFullName: string,
+		sha: string,
+		token: string | undefined,
+	): Promise<{
+		checkRuns: CheckRunSummary[];
+		statuses: CommitStatusSummary[];
+	} | null> {
+		const checkRuns: CheckRunSummary[] = [];
+		for (let page = 1; page <= 10; page++) {
+			const response = await this.githubApiGet(
+				`/repos/${repoFullName}/commits/${sha}/check-runs?per_page=100&page=${page}`,
+				token,
+			);
+			if (!response) return null;
+			if (!response.ok) {
+				this.warnCiApiFailure("check runs", "Checks: read", response.status);
+				return null;
+			}
+			const data = (await response.json()) as {
+				total_count?: number;
+				check_runs?: CheckRunSummary[];
+			};
+			const runs = data.check_runs ?? [];
+			checkRuns.push(
+				...runs.map(({ name, status, conclusion }) => ({
+					name,
+					status,
+					conclusion,
+				})),
+			);
+			if (runs.length < 100 || checkRuns.length >= (data.total_count ?? 0)) {
+				break;
+			}
+		}
+
+		// Commit statuses (the older API some CI still uses). Without read
+		// access to them, go by the check runs alone.
+		let statuses: CommitStatusSummary[] = [];
+		const response = await this.githubApiGet(
+			`/repos/${repoFullName}/commits/${sha}/status?per_page=100`,
+			token,
+		);
+		if (response?.ok) {
+			const data = (await response.json()) as {
+				statuses?: CommitStatusSummary[];
+			};
+			statuses = (data.statuses ?? []).map(({ context, state }) => ({
+				context,
+				state,
+			}));
+		} else if (response) {
+			this.warnCiApiFailure(
+				"commit statuses",
+				"Commit statuses: read",
+				response.status,
+			);
+		}
+		return { checkRuns, statuses };
+	}
+
+	/** GET a GitHub REST path; null (logged) when the request itself fails. */
+	private async githubApiGet(
+		path: string,
+		token: string | undefined,
+	): Promise<Response | null> {
+		const headers: Record<string, string> = {
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+		};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		try {
+			return await fetch(`https://api.github.com${path}`, { headers });
+		} catch (error) {
+			this.logger.warn(
+				`GitHub API request failed: GET ${path}`,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			return null;
+		}
+	}
+
+	/**
+	 * A 403/404 here almost always means the GitHub App lacks a permission;
+	 * say so once instead of on every suite.
+	 */
+	private warnCiApiFailure(
+		what: string,
+		permission: string,
+		status: number,
+	): void {
+		if (status !== 403 && status !== 404) {
+			this.logger.warn(`Could not read ${what} from GitHub: HTTP ${status}`);
+			return;
+		}
+		if (this.ciPermissionWarnings.has(what)) return;
+		this.ciPermissionWarnings.add(what);
+		this.logger.warn(
+			`Could not read ${what} from GitHub (HTTP ${status}). CI failure notifications need the GitHub App's "${permission}" permission; grant it and accept the new permissions on the installation.`,
+		);
 	}
 
 	/**
@@ -7526,6 +7817,9 @@ ${input.userComment}
 			...(Object.keys(this.pendingRestartPrompts).length > 0 && {
 				pendingRestartPrompts: { ...this.pendingRestartPrompts },
 			}),
+			...(this.ciFailureNotifiedShas.size > 0 && {
+				ciFailureNotifiedShas: this.ciFailureNotifiedShas.toJSON(),
+			}),
 		};
 	}
 
@@ -7535,6 +7829,9 @@ ${input.userComment}
 	public restoreMappings(state: SerializableEdgeWorkerState): void {
 		if (state.pendingRestartPrompts) {
 			this.pendingRestartPrompts = { ...state.pendingRestartPrompts };
+		}
+		if (state.ciFailureNotifiedShas) {
+			this.ciFailureNotifiedShas.restore(state.ciFailureNotifiedShas);
 		}
 
 		// Restore Agent Session state from flat format
