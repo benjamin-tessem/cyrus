@@ -117,7 +117,8 @@ describe("handleGitHubTokens", () => {
 				"--global",
 				"--add",
 				"credential.https://github.com.helper",
-				`!node "${scriptPath}"`,
+				// cyrusHome is a temp dir, not ~/.cyrus, so the helper pins it
+				`!CYRUS_HOME='${cyrusHome}' node "${scriptPath}"`,
 			],
 			expect.anything(),
 		);

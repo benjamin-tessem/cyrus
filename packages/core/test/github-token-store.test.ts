@@ -218,4 +218,76 @@ describe("GitHubTokenStore", () => {
 			expect(store.getFallbackToken()).toBeUndefined();
 		});
 	});
+
+	describe("self-hosted App tokens", () => {
+		const selfHosted = (overrides: Partial<GitHubInstallationToken> = {}) =>
+			token({
+				installationId: "999",
+				organization: "SelfOrg",
+				token: "ghs_self_1",
+				...overrides,
+			});
+
+		it("upserts the self-minted token, replacing the previous one for the installation", () => {
+			expect(store.upsertSelfHostedAppToken(selfHosted())).toBe(true);
+			expect(
+				store.upsertSelfHostedAppToken(selfHosted({ token: "ghs_self_2" })),
+			).toBe(true);
+
+			const tokens = store.load();
+			expect(tokens).toHaveLength(1);
+			expect(tokens[0]).toMatchObject({
+				token: "ghs_self_2",
+				source: "self-hosted-app",
+			});
+			expect(store.getTokenForOrg("selforg")).toBe("ghs_self_2");
+			expect(statSync(store.filePath).mode & 0o777).toBe(0o600);
+		});
+
+		it("keeps pushed tokens for other orgs untouched", () => {
+			store.save([token()]);
+			store.upsertSelfHostedAppToken(selfHosted());
+
+			expect(store.getTokenForOrg("CeedarAgents")).toBe("ghs_org_token");
+			expect(store.getTokenForOrg("SelfOrg")).toBe("ghs_self_1");
+			expect(store.load()[0]).not.toHaveProperty("source");
+		});
+
+		it("does not write when a valid pushed token covers the same org", () => {
+			store.save([token({ organization: "SelfOrg", token: "ghs_pushed" })]);
+			expect(store.upsertSelfHostedAppToken(selfHosted())).toBe(false);
+			expect(store.load()).toHaveLength(1);
+			expect(store.getTokenForOrg("SelfOrg")).toBe("ghs_pushed");
+		});
+
+		it("fills the gap when the pushed token for the org has expired", () => {
+			store.save([
+				token({
+					organization: "SelfOrg",
+					token: "ghs_pushed_old",
+					expiresAt: new Date(Date.now() - 1000).toISOString(),
+				}),
+			]);
+			expect(store.upsertSelfHostedAppToken(selfHosted())).toBe(true);
+			expect(store.getTokenForOrg("SelfOrg")).toBe("ghs_self_1");
+		});
+
+		it("a hosted push keeps self-minted tokens for orgs it does not cover", () => {
+			store.upsertSelfHostedAppToken(selfHosted());
+			store.saveHostedTokens([token()]);
+
+			expect(store.getTokenForOrg("CeedarAgents")).toBe("ghs_org_token");
+			expect(store.getTokenForOrg("SelfOrg")).toBe("ghs_self_1");
+		});
+
+		it("a hosted push for the same org replaces the self-minted token", () => {
+			store.upsertSelfHostedAppToken(selfHosted());
+			store.saveHostedTokens([
+				token({ organization: "selforg", token: "ghs_pushed" }),
+			]);
+
+			expect(store.load()).toHaveLength(1);
+			expect(store.getTokenForOrg("SelfOrg")).toBe("ghs_pushed");
+		});
+	});
 });

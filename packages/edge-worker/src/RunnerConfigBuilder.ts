@@ -189,6 +189,13 @@ export interface IssueRunnerConfigInput {
 	 * `gh auth login` the github-tokens push handler performs.
 	 */
 	githubToken?: string;
+	/**
+	 * Org the `githubToken` belongs to, exposed as `CYRUS_GH_ORG` so the gh
+	 * resolver can look up that org's current token in the store on every
+	 * call instead of relying on `CYRUS_GH_TOKEN`, which expires within an
+	 * hour of session start.
+	 */
+	githubOrg?: string;
 }
 
 export function resolveIssueMcpConfigPath(
@@ -525,6 +532,7 @@ export class RunnerConfigBuilder {
 			config.additionalEnv = {
 				...config.additionalEnv,
 				CYRUS_GH_TOKEN: input.githubToken,
+				...(input.githubOrg && { CYRUS_GH_ORG: input.githubOrg }),
 			};
 		}
 

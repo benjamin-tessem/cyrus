@@ -222,4 +222,90 @@ describe("GitHubAppTokenProvider", () => {
 
 		fetchSpy.mockRestore();
 	});
+
+	it("mints ahead of expiry when a larger minimum validity is requested", async () => {
+		const in15Min = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+		const in60Min = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ token: "ghs_a", expires_at: in15Min }), {
+					status: 200,
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ token: "ghs_b", expires_at: in60Min }), {
+					status: 200,
+				}),
+			);
+
+		const provider = new GitHubAppTokenProvider({
+			appId: "12345",
+			installationId: "67890",
+			privateKeyPath: pemPath,
+		});
+
+		expect(await provider.getInstallationToken()).toEqual({
+			token: "ghs_a",
+			expiresAt: new Date(in15Min).toISOString(),
+		});
+		// 15 minutes left is enough for the default 5-minute buffer...
+		expect(await provider.getToken()).toBe("ghs_a");
+		// ...but not when the caller asks for 20 minutes.
+		expect(await provider.getInstallationToken(20 * 60 * 1000)).toEqual({
+			token: "ghs_b",
+			expiresAt: new Date(in60Min).toISOString(),
+		});
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+		fetchSpy.mockRestore();
+	});
+
+	it("looks up and caches the installation account", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 67890,
+					account: { login: "MyOrg", type: "Organization" },
+				}),
+				{ status: 200 },
+			),
+		);
+
+		const provider = new GitHubAppTokenProvider({
+			appId: "12345",
+			installationId: "67890",
+			privateKeyPath: pemPath,
+		});
+
+		const expected = { login: "MyOrg", type: "Organization" };
+		expect(await provider.getInstallationAccount()).toEqual(expected);
+		expect(await provider.getInstallationAccount()).toEqual(expected);
+		expect(fetchSpy).toHaveBeenCalledOnce();
+		const [url, opts] = fetchSpy.mock.calls[0];
+		expect(url).toBe("https://api.github.com/app/installations/67890");
+		expect((opts as RequestInit).method).toBe("GET");
+
+		fetchSpy.mockRestore();
+	});
+
+	it("throws when the installation lookup fails", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				new Response("Not Found", { status: 404, statusText: "Not Found" }),
+			);
+
+		const provider = new GitHubAppTokenProvider({
+			appId: "12345",
+			installationId: "67890",
+			privateKeyPath: pemPath,
+		});
+
+		await expect(provider.getInstallationAccount()).rejects.toThrow(
+			"Failed to look up installation: 404",
+		);
+
+		fetchSpy.mockRestore();
+	});
 });

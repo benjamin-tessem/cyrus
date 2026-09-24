@@ -61,6 +61,7 @@ describe("gh-cyrus per-invocation token resolution", () => {
 				GITHUB_TOKEN: "customer_github_token",
 				GH_TOKEN: "customer_gh_token",
 				CYRUS_GH_TOKEN: undefined,
+				CYRUS_GH_ORG: undefined,
 				...opts.env,
 			} as NodeJS.ProcessEnv,
 		});
@@ -219,6 +220,35 @@ exit 0
 
 		const { stdout } = runGhCyrus(["api", "/user"], {
 			env: { CYRUS_GH_TOKEN: "ghs_session_token" },
+		});
+
+		expect(stdout).toContain("GH_TOKEN=ghs_session_token");
+	});
+
+	it("prefers the fresh store token for CYRUS_GH_ORG over a stale CYRUS_GH_TOKEN outside a repo", () => {
+		saveTokens([
+			{ organization: "OrgA", token: "ghs_org_a_refreshed" },
+			{ organization: "OrgB", token: "ghs_org_b" },
+		]);
+
+		const { stdout } = runGhCyrus(["api", "/user"], {
+			env: {
+				CYRUS_GH_ORG: "orga",
+				CYRUS_GH_TOKEN: "ghs_org_a_from_session_start",
+			},
+		});
+
+		expect(stdout).toContain("GH_TOKEN=ghs_org_a_refreshed");
+	});
+
+	it("falls back to CYRUS_GH_TOKEN when CYRUS_GH_ORG has no store entry", () => {
+		saveTokens([
+			{ organization: "OrgA", token: "ghs_org_a" },
+			{ organization: "OrgB", token: "ghs_org_b" },
+		]);
+
+		const { stdout } = runGhCyrus(["api", "/user"], {
+			env: { CYRUS_GH_ORG: "OrgC", CYRUS_GH_TOKEN: "ghs_session_token" },
 		});
 
 		expect(stdout).toContain("GH_TOKEN=ghs_session_token");

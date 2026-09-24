@@ -17,10 +17,13 @@
  * Then the token, from `<cyrusHome>/github-tokens.json` (pushed by
  * cyrus-hosted):
  *   3. The org-matched token.
- *   4. `CYRUS_GH_TOKEN` from the session env (set to the session's primary
- *      repository's org token — covers repo-less commands like `gh api`).
- *   5. The single valid token, when exactly one exists.
- *   6. No token: fall through to gh's own stored auth (hosts.yml).
+ *   4. The token for `CYRUS_GH_ORG` (the session's primary repository's
+ *      org), read fresh from the store — covers repo-less commands like
+ *      `gh api` in sessions that outlive a token.
+ *   5. `CYRUS_GH_TOKEN` from the session env (that org's token as of
+ *      session start).
+ *   6. The single valid token, when exactly one exists.
+ *   7. No token: fall through to gh's own stored auth (hosts.yml).
  *
  * In every case the customer-controlled GITHUB_TOKEN / GH_TOKEN env vars
  * are removed from gh's environment (the wrapper's historical contract);
@@ -143,16 +146,21 @@ function resolveToken(args) {
 		ownerFromRepoRef(process.env.GH_REPO) ||
 		ownerFromCwd();
 	const valid = loadValidTokens();
-
-	if (owner) {
-		const lowered = owner.toLowerCase();
+	const tokenForOrg = (org) => {
+		if (!org) return undefined;
+		const lowered = org.toLowerCase();
 		const match = valid.find(
 			(t) =>
 				typeof t.organization === "string" &&
 				t.organization.toLowerCase() === lowered,
 		);
-		if (match) return match.token;
-	}
+		return match ? match.token : undefined;
+	};
+
+	const ownerToken = tokenForOrg(owner);
+	if (ownerToken) return ownerToken;
+	const sessionOrgToken = tokenForOrg(process.env.CYRUS_GH_ORG);
+	if (sessionOrgToken) return sessionOrgToken;
 	if (process.env.CYRUS_GH_TOKEN) return process.env.CYRUS_GH_TOKEN;
 	if (valid.length === 1) return valid[0].token;
 	return undefined;

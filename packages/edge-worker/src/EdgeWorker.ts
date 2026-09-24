@@ -60,6 +60,7 @@ import {
 	CLIRPCServer,
 	createLogger,
 	DEFAULT_PROXY_URL,
+	extractOwnerFromGitHubUrl,
 	GitHubTokenStore,
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
@@ -97,7 +98,7 @@ import {
 	extractRepoName,
 	extractRepoOwner,
 	extractSessionKey,
-	GitHubAppTokenProvider,
+	type GitHubAppTokenProvider,
 	type GitHubCheckSuitePayload,
 	GitHubCommentService,
 	type GitHubCommentWebhookEvent,
@@ -200,6 +201,10 @@ import {
 	resolveIssueMcpConfigPath,
 } from "./RunnerConfigBuilder.js";
 import { RunnerSelectionService } from "./RunnerSelectionService.js";
+import {
+	createGitHubAppTokenProviderFromEnv,
+	SelfHostedGitHubAppCredentials,
+} from "./SelfHostedGitHubAppCredentials.js";
 import { SharedApplicationServer } from "./SharedApplicationServer.js";
 import {
 	type SkillSessionContext,
@@ -246,6 +251,8 @@ export class EdgeWorker extends EventEmitter {
 	private linearEventTransport: LinearEventTransport | null = null; // Single event transport for webhook delivery
 	private gitHubEventTransport: GitHubEventTransport | null = null; // GitHub event transport for forwarded GitHub webhooks
 	private gitHubAppTokenProvider: GitHubAppTokenProvider | null = null; // Self-hosted GitHub App token minting
+	private selfHostedGitHubAppCredentials: SelfHostedGitHubAppCredentials | null =
+		null; // Keeps agents' git/gh supplied with fresh App tokens (self-hosted)
 	private gitLabEventTransport: GitLabEventTransport | null = null; // GitLab event transport for forwarded GitLab webhooks
 	private slackEventTransport: SlackEventTransport | null = null;
 	private zulipEventTransport: ZulipEventTransport | null = null;
@@ -702,6 +709,10 @@ export class EdgeWorker extends EventEmitter {
 				);
 			}
 		}
+
+		// Self-hosted GitHub App: give agents' git and gh fresh installation
+		// tokens through the same token store + helpers.
+		await this.startSelfHostedGitHubApp();
 
 		// Deploy default skills to cyrusHome if not already present (one-time setup)
 		await this.defaultSkillsDeployer.ensureDeployed();
@@ -1229,21 +1240,6 @@ export class EdgeWorker extends EventEmitter {
 
 		// Register the /github-webhook endpoint
 		this.gitHubEventTransport.register();
-
-		// Initialize GitHub App token provider for self-hosted users
-		const appId = process.env.GITHUB_APP_ID;
-		const installationId = process.env.GITHUB_APP_INSTALLATION_ID;
-		if (appId && installationId) {
-			const pemPath = join(this.cyrusHome, "github-app.pem");
-			this.gitHubAppTokenProvider = new GitHubAppTokenProvider({
-				appId,
-				installationId,
-				privateKeyPath: pemPath,
-			});
-			this.logger.info(
-				"GitHub App token provider initialized (self-hosted mode)",
-			);
-		}
 
 		this.logger.info(
 			`GitHub event transport registered (${verificationMode} mode)`,
@@ -3297,9 +3293,41 @@ ${taskSection}`;
 	}
 
 	/**
+	 * Self-hosted GitHub App mode (GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID,
+	 * key at <cyrusHome>/github-app.pem): create the token provider used for
+	 * Cyrus's own GitHub API calls, and keep a fresh installation token in
+	 * the token store for agents' git and gh. No-op without both env vars.
+	 */
+	private async startSelfHostedGitHubApp(
+		env: NodeJS.ProcessEnv = process.env,
+	): Promise<void> {
+		const provider = createGitHubAppTokenProviderFromEnv(env, this.cyrusHome);
+		if (!provider) return;
+		this.gitHubAppTokenProvider = provider;
+		this.logger.info(
+			"GitHub App token provider initialized (self-hosted mode)",
+		);
+
+		this.selfHostedGitHubAppCredentials = new SelfHostedGitHubAppCredentials({
+			cyrusHome: this.cyrusHome,
+			provider,
+			logger: this.logger,
+			store: this.githubTokenStore,
+			getRepositoryUrls: () =>
+				Array.from(this.repositories.values())
+					.map((repo) => repo.githubUrl)
+					.filter((url): url is string => !!url),
+		});
+		await this.selfHostedGitHubAppCredentials.start();
+	}
+
+	/**
 	 * Stop the edge worker
 	 */
 	async stop(): Promise<void> {
+		this.selfHostedGitHubAppCredentials?.stop();
+		this.selfHostedGitHubAppCredentials = null;
+
 		// Stop config file watcher
 		await this.configManager.stop();
 		this.queueNotifier.stop();
@@ -7396,6 +7424,11 @@ ${input.userComment}
 			// users without the token file.
 			githubToken: repository.githubUrl
 				? this.githubTokenStore.getTokenForRepoUrl(repository.githubUrl)
+				: undefined,
+			// Lets the gh resolver re-read this org's token from the store on
+			// every call, so sessions outliving the token above keep working.
+			githubOrg: repository.githubUrl
+				? (extractOwnerFromGitHubUrl(repository.githubUrl) ?? undefined)
 				: undefined,
 			logger: log,
 			plugins,

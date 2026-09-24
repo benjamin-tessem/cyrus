@@ -84,6 +84,18 @@ describe("RunnerConfigBuilder GitHub token session env (CYHOST-913)", () => {
 		});
 	});
 
+	it("adds CYRUS_GH_ORG alongside the token when the org is known", () => {
+		const { config } = buildIssueConfig({
+			githubToken: "ghs_org_token",
+			githubOrg: "MyOrg",
+		});
+
+		expect(config.additionalEnv).toEqual({
+			CYRUS_GH_TOKEN: "ghs_org_token",
+			CYRUS_GH_ORG: "MyOrg",
+		});
+	});
+
 	it("sets no additionalEnv when githubToken is absent (zero behavior change)", () => {
 		const { config } = buildIssueConfig();
 

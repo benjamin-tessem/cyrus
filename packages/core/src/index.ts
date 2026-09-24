@@ -128,6 +128,7 @@ export {
 	extractOwnerFromGitHubUrl,
 	GITHUB_TOKENS_FILENAME,
 	GitHubTokenStore,
+	SELF_HOSTED_APP_TOKEN_SOURCE,
 } from "./github-token-store.js";
 // Issue Tracker Abstraction
 export type {

@@ -42,6 +42,63 @@ export function ensureGhTokenResolver(cyrusHome: string): string {
 	return scriptDest;
 }
 
+/** Quote a string for safe interpolation into a POSIX shell command */
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Install a `gh` shim at `<cyrusHome>/bin/gh` that routes every gh
+ * invocation through the per-invocation token resolver
+ * (`<cyrusHome>/scripts/gh-cyrus.cjs`, installed alongside).
+ *
+ * Hosted droplets get the same routing from the `~/.local/bin/gh` wrapper
+ * baked into their image; self-hosted installs have no such wrapper, so
+ * the EdgeWorker installs this shim and prepends its directory to PATH,
+ * which every agent process inherits. The shim finds the real gh as the
+ * next `gh` on PATH after its own directory (or `CYRUS_GH_REAL_BIN` when
+ * set) and pins `CYRUS_HOME` so the resolver reads this installation's
+ * token store. Idempotent.
+ *
+ * Returns the directory holding the shim (the one to put on PATH).
+ */
+export function ensureGhShim(cyrusHome: string): string {
+	const resolverPath = ensureGhTokenResolver(cyrusHome);
+	const binDir = join(cyrusHome, "bin");
+	const shimPath = join(binDir, "gh");
+	mkdirSync(binDir, { recursive: true });
+
+	const shim = `#!/usr/bin/env bash
+# Cyrus-managed gh shim: resolves a fresh GitHub App installation token
+# for the org each command targets (see gh-cyrus.cjs). Regenerated on
+# every Cyrus start; do not edit.
+if [ -z "\${CYRUS_GH_REAL_BIN:-}" ]; then
+  self_path="\${BASH_SOURCE[0]}"
+  [ "$self_path" = "\${self_path%/*}" ] && self_path="./$self_path"
+  self_dir="$(cd "\${self_path%/*}" && pwd -P)"
+  IFS=: read -ra path_dirs <<< "\${PATH:-}"
+  for dir in "\${path_dirs[@]}"; do
+    [ -n "$dir" ] || continue
+    [ "$(cd "$dir" 2>/dev/null && pwd -P)" = "$self_dir" ] && continue
+    if [ -f "$dir/gh" ] && [ -x "$dir/gh" ]; then
+      CYRUS_GH_REAL_BIN="$dir/gh"
+      break
+    fi
+  done
+fi
+if [ -z "\${CYRUS_GH_REAL_BIN:-}" ]; then
+  echo "gh: GitHub CLI not found on PATH" >&2
+  exit 127
+fi
+export CYRUS_GH_REAL_BIN
+export CYRUS_HOME=${shellQuote(cyrusHome)}
+exec ${shellQuote(process.execPath)} ${shellQuote(resolverPath)} "$@"
+`;
+	writeFileSync(shimPath, shim, { mode: 0o755 });
+	chmodSync(shimPath, 0o755);
+	return binDir;
+}
+
 /**
  * Install the Cyrus git credential helper and wire it into the global git
  * config for github.com. Idempotent — safe to run on every token push and
@@ -78,12 +135,18 @@ export function ensureGitHubCredentialHelper(cyrusHome: string): string {
 	// call ends with exactly ["", "!node <script>"].
 	git(["config", "--global", "--replace-all", `${credentialKey}.helper`, ""]);
 	// Quote the script path — helper commands are run through the shell.
+	// The helper defaults to ~/.cyrus; pin CYRUS_HOME for any other home so
+	// it reads this installation's token store.
+	const envPrefix =
+		cyrusHome === join(homedir(), ".cyrus")
+			? ""
+			: `CYRUS_HOME=${shellQuote(cyrusHome)} `;
 	git([
 		"config",
 		"--global",
 		"--add",
 		`${credentialKey}.helper`,
-		`!node "${scriptDest}"`,
+		`!${envPrefix}node "${scriptDest}"`,
 	]);
 
 	return scriptDest;
@@ -187,7 +250,7 @@ export async function handleGitHubTokens(
 	// Persist the tokens first — even if git configuration fails below, the
 	// EdgeWorker can still resolve tokens from the store for API calls.
 	try {
-		new GitHubTokenStore(cyrusHome).save(payload.tokens);
+		new GitHubTokenStore(cyrusHome).saveHostedTokens(payload.tokens);
 	} catch (error) {
 		return {
 			success: false,

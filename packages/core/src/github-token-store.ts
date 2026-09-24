@@ -25,7 +25,17 @@ export interface GitHubInstallationToken {
 	token: string;
 	/** ISO timestamp when the token expires */
 	expiresAt: string;
+	/**
+	 * Where the entry came from. Absent for tokens pushed by cyrus-hosted;
+	 * `"self-hosted-app"` for tokens Cyrus mints itself from the self-hosted
+	 * GitHub App credentials (GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID).
+	 * The git credential helper and gh resolver ignore this field.
+	 */
+	source?: typeof SELF_HOSTED_APP_TOKEN_SOURCE;
 }
+
+/** `source` marker for tokens minted from self-hosted GitHub App credentials */
+export const SELF_HOSTED_APP_TOKEN_SOURCE = "self-hosted-app";
 
 /**
  * On-disk shape of `<cyrusHome>/github-tokens.json`.
@@ -133,6 +143,65 @@ export class GitHubTokenStore {
 		this.cachedTokens = null;
 		this.cachedMtimeMs = null;
 		this.cachedSize = null;
+	}
+
+	/**
+	 * Persist a push from cyrus-hosted. The pushed set replaces every
+	 * previously pushed token, but self-minted App tokens survive for orgs
+	 * the push does not cover (kept after the pushed entries, so pushed
+	 * tokens always win lookups).
+	 */
+	saveHostedTokens(tokens: GitHubInstallationToken[]): void {
+		const pushedOrgs = new Set(
+			tokens
+				.map((t) => t.organization?.toLowerCase())
+				.filter((org): org is string => !!org),
+		);
+		const preserved = this.load().filter(
+			(t) =>
+				t.source === SELF_HOSTED_APP_TOKEN_SOURCE &&
+				!(t.organization && pushedOrgs.has(t.organization.toLowerCase())),
+		);
+		this.save([...tokens, ...preserved]);
+	}
+
+	/**
+	 * Insert or replace the self-minted token for a self-hosted GitHub App
+	 * installation. Pushed (hosted) tokens are never modified: when a
+	 * non-expired pushed token already covers the same org, the self-minted
+	 * one is not written (and any stale self-minted entry for that
+	 * installation is dropped), so it only ever fills gaps.
+	 *
+	 * @returns true when the token was written, false when a pushed token
+	 *   for the same org takes precedence.
+	 */
+	upsertSelfHostedAppToken(
+		token: Omit<GitHubInstallationToken, "source">,
+	): boolean {
+		const now = Date.now();
+		const current = this.load();
+		const others = current.filter(
+			(t) =>
+				!(
+					t.source === SELF_HOSTED_APP_TOKEN_SOURCE &&
+					t.installationId === token.installationId
+				),
+		);
+		const org = token.organization?.toLowerCase();
+		const coveredByPushed =
+			!!org &&
+			others.some(
+				(t) =>
+					t.source !== SELF_HOSTED_APP_TOKEN_SOURCE &&
+					t.organization?.toLowerCase() === org &&
+					!isExpired(t, now),
+			);
+		if (coveredByPushed) {
+			if (others.length !== current.length) this.save(others);
+			return false;
+		}
+		this.save([...others, { ...token, source: SELF_HOSTED_APP_TOKEN_SOURCE }]);
+		return true;
 	}
 
 	/**

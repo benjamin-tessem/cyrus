@@ -1,4 +1,8 @@
-export type { GitHubAppTokenProviderConfig } from "./GitHubAppTokenProvider.js";
+export type {
+	GitHubAppInstallationAccount,
+	GitHubAppInstallationToken,
+	GitHubAppTokenProviderConfig,
+} from "./GitHubAppTokenProvider.js";
 export {
 	createAppJwt,
 	GitHubAppTokenProvider,
