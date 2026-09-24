@@ -597,6 +597,9 @@
 		"global_setup_script": {
 			"type": "string"
 		},
+		"global_teardown_script": {
+			"type": "string"
+		},
 		"linearAllowedTools": {
 			"type": "array",
 			"items": {

@@ -449,6 +449,14 @@ export const EdgeConfigSchema = z.object({
 	global_setup_script: z.string().optional(),
 
 	/**
+	 * Optional path to a global teardown script, the counterpart of
+	 * global_setup_script. Runs in each repository worktree after that repo's
+	 * own cyrus-teardown script, when an issue reaches Done/Canceled and just
+	 * before its worktree is removed.
+	 */
+	global_teardown_script: z.string().optional(),
+
+	/**
 	 * Allowed tools for Linear-triggered agent sessions. Renamed from the
 	 * old `defaultAllowedTools` to make the platform scope explicit alongside
 	 * `slackAllowedTools` and `githubAllowedTools`.

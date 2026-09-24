@@ -50,6 +50,11 @@ export interface DeleteWorktreeOptions {
 	 * In multi-repo layouts, it is `<workspace>/<repository.name>/`.
 	 */
 	repositories?: RepositoryConfig[];
+	/**
+	 * Global teardown script (config `global_teardown_script`), run in each
+	 * repo worktree after that repo's own cyrus-teardown script.
+	 */
+	globalTeardownScript?: string;
 }
 
 /** Timeout for repo setup scripts (cyrus-setup.*). */
@@ -1057,6 +1062,7 @@ export class GitService {
 			issueIdentifier,
 			workspacePath,
 			repositories: options.repositories,
+			globalTeardownScript: options.globalTeardownScript,
 		});
 
 		// Collect parent repository paths so we can prune stale entries after deletion
@@ -1128,8 +1134,14 @@ export class GitService {
 		issueIdentifier: string;
 		workspacePath: string;
 		repositories?: RepositoryConfig[];
+		globalTeardownScript?: string;
 	}): Promise<void> {
-		const { issueIdentifier, workspacePath, repositories } = opts;
+		const {
+			issueIdentifier,
+			workspacePath,
+			repositories,
+			globalTeardownScript,
+		} = opts;
 
 		// Build the worktree cwd list. Prefer the explicit list from the caller.
 		const targets: string[] = [];
@@ -1156,7 +1168,18 @@ export class GitService {
 
 		for (const workspacePath of targets) {
 			try {
+				// Reverse of setup (global, then repo): repo first, then global.
 				await this.runRepoTeardownScript(workspacePath, issueIdentifier);
+				if (globalTeardownScript) {
+					await this.runHookScript({
+						scriptPath: globalTeardownScript,
+						hook: "teardown",
+						originLabel: "global",
+						cwd: workspacePath,
+						env: { LINEAR_ISSUE_IDENTIFIER: issueIdentifier },
+						timeoutMs: TEARDOWN_TIMEOUT_MS,
+					});
+				}
 			} catch (error) {
 				// runRepoTeardownScript already swallows execSync failures and
 				// logs them; this catch is defensive against unexpected throws

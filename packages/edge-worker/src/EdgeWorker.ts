@@ -3848,6 +3848,7 @@ ${taskSection}`;
 		// Delete worktrees for this issue, keyed by the Linear issue identifier.
 		await this.gitService.deleteWorktree(message.workItemIdentifier, {
 			repositories: teardownRepositories,
+			globalTeardownScript: this.config.global_teardown_script,
 		});
 
 		this.logger.info(

@@ -32,6 +32,7 @@ const RELOAD_MERGED_KEYS = [
 	"ngrokAuthToken",
 	"stripeCustomerId",
 	"global_setup_script",
+	"global_teardown_script",
 	"linearWorkspaces",
 	"claudeDefaultModel",
 	"claudeDefaultFallbackModel",
@@ -382,6 +383,9 @@ export class ConfigManager extends EventEmitter {
 					parsedConfig.stripeCustomerId ?? this.config.stripeCustomerId,
 				global_setup_script:
 					parsedConfig.global_setup_script ?? this.config.global_setup_script,
+				global_teardown_script:
+					parsedConfig.global_teardown_script ??
+					this.config.global_teardown_script,
 				// Sandbox / egress proxy config
 				sandbox: parsedConfig.sandbox ?? this.config.sandbox,
 			};

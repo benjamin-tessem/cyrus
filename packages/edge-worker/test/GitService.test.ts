@@ -1260,6 +1260,88 @@ describe("GitService", () => {
 			expect(mockRmSync).toHaveBeenCalled();
 		});
 
+		it("runs the global teardown script after the repo's, before removal", async () => {
+			setupSingleRepoFs();
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-123") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-123/.git") return true;
+				if (p === "/home/user/repos/repo-a") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-123/cyrus-teardown.sh")
+					return true;
+				if (p === "/opt/hooks/teardown.sh") return true;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-123/.git") {
+					return { isFile: () => true } as any;
+				}
+				if (p.endsWith(".sh")) {
+					return { mode: 0o755, isFile: () => false } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+			mockExecSync.mockReturnValue(Buffer.from(""));
+
+			await gitService.deleteWorktree("DEF-123", {
+				repositories: [makeRepo("a", "repo-a", "/home/user/repos/repo-a")],
+				globalTeardownScript: "/opt/hooks/teardown.sh",
+			});
+
+			expect(mockExecSync).toHaveBeenCalledWith(
+				'bash "/opt/hooks/teardown.sh"',
+				expect.objectContaining({
+					cwd: "/home/user/.cyrus/worktrees/DEF-123",
+					env: expect.objectContaining({
+						LINEAR_ISSUE_IDENTIFIER: "DEF-123",
+					}),
+				}),
+			);
+			const order = (needle: string) =>
+				mockExecSync.mock.invocationCallOrder.find((_, index) =>
+					String(mockExecSync.mock.calls[index]?.[0]).includes(needle),
+				)!;
+			expect(order("cyrus-teardown.sh")).toBeLessThan(
+				order("/opt/hooks/teardown.sh"),
+			);
+			expect(order("/opt/hooks/teardown.sh")).toBeLessThan(
+				order("worktree remove"),
+			);
+		});
+
+		it("still runs the global teardown when the repo has none", async () => {
+			setupSingleRepoFs();
+			mockExistsSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-123") return true;
+				if (p === "/home/user/.cyrus/worktrees/DEF-123/.git") return true;
+				if (p === "/home/user/repos/repo-a") return true;
+				if (p === "/opt/hooks/teardown.sh") return true;
+				return false;
+			});
+			mockStatSync.mockImplementation((path: any) => {
+				const p = String(path);
+				if (p === "/home/user/.cyrus/worktrees/DEF-123/.git") {
+					return { isFile: () => true } as any;
+				}
+				if (p === "/opt/hooks/teardown.sh") {
+					return { mode: 0o755, isFile: () => false } as any;
+				}
+				return { isFile: () => false } as any;
+			});
+			mockExecSync.mockReturnValue(Buffer.from(""));
+
+			await gitService.deleteWorktree("DEF-123", {
+				repositories: [makeRepo("a", "repo-a", "/home/user/repos/repo-a")],
+				globalTeardownScript: "/opt/hooks/teardown.sh",
+			});
+
+			const calls = mockExecSync.mock.calls.map((c) => String(c[0]));
+			expect(calls).toContain('bash "/opt/hooks/teardown.sh"');
+			expect(mockRmSync).toHaveBeenCalled();
+		});
+
 		it("does not run teardown when cyrus-teardown.sh is absent, still deletes worktree", async () => {
 			setupSingleRepoFs();
 			mockExecSync.mockReturnValue(Buffer.from(""));
