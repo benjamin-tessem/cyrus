@@ -106,6 +106,19 @@ function isExpired(token: GitHubInstallationToken, now: number): boolean {
  * (which runs in the same process but writes via this class too) or any
  * external writer.
  */
+/**
+ * File mode for the token store: owner-only (0600) unless
+ * CYRUS_GITHUB_TOKEN_STORE_MODE sets another octal mode, e.g. 0640 when
+ * agents run as a separate OS user in Cyrus's group and need the tokens for
+ * git and gh. Values granting access to others are ignored.
+ */
+function tokenStoreMode(): number {
+	const raw = process.env.CYRUS_GITHUB_TOKEN_STORE_MODE?.trim();
+	if (!raw || !/^0?[0-7]{3}$/.test(raw)) return 0o600;
+	const mode = Number.parseInt(raw, 8);
+	return (mode & 0o007) === 0 ? mode : 0o600;
+}
+
 export class GitHubTokenStore {
 	private cyrusHome: string;
 	private cachedTokens: GitHubInstallationToken[] | null = null;
@@ -134,9 +147,10 @@ export class GitHubTokenStore {
 		const target = this.filePath;
 		mkdirSync(dirname(target), { recursive: true });
 		const tmpPath = `${target}.tmp`;
-		writeFileSync(tmpPath, JSON.stringify(file, null, 2), { mode: 0o600 });
+		const mode = tokenStoreMode();
+		writeFileSync(tmpPath, JSON.stringify(file, null, 2), { mode });
 		// writeFileSync `mode` only applies on creation — enforce on overwrite too
-		chmodSync(tmpPath, 0o600);
+		chmodSync(tmpPath, mode);
 		renameSync(tmpPath, target);
 		// Invalidate the read cache so the next load reflects this write even
 		// if the rename lands within the same mtime granularity window.

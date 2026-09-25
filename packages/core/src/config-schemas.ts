@@ -457,6 +457,20 @@ export const EdgeConfigSchema = z.object({
 	global_teardown_script: z.string().optional(),
 
 	/**
+	 * Command Cyrus runs instead of the Claude Code CLI bundled with the Agent
+	 * SDK. The SDK passes it the same arguments. Use it to wrap the CLI, for
+	 * example to run agents as a different OS user than Cyrus itself so they
+	 * cannot read Cyrus's config, tokens or keys.
+	 */
+	claudeCodeExecutable: z.string().optional(),
+
+	/**
+	 * Command Cyrus runs instead of the bundled Codex CLI (same arguments,
+	 * e.g. `app-server`). Same purpose as claudeCodeExecutable.
+	 */
+	codexExecutable: z.string().optional(),
+
+	/**
 	 * Allowed tools for Linear-triggered agent sessions. Renamed from the
 	 * old `defaultAllowedTools` to make the platform scope explicit alongside
 	 * `slackAllowedTools` and `githubAllowedTools`.

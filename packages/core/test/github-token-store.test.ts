@@ -102,6 +102,30 @@ describe("GitHubTokenStore", () => {
 			expect(statSync(filePath).mode & 0o777).toBe(0o600);
 		});
 
+		it("uses CYRUS_GITHUB_TOKEN_STORE_MODE for group access, never for others", () => {
+			const filePath = join(cyrusHome, "github-tokens.json");
+			const previous = process.env.CYRUS_GITHUB_TOKEN_STORE_MODE;
+			try {
+				process.env.CYRUS_GITHUB_TOKEN_STORE_MODE = "0640";
+				store.save([token()]);
+				expect(statSync(filePath).mode & 0o777).toBe(0o640);
+
+				process.env.CYRUS_GITHUB_TOKEN_STORE_MODE = "0644";
+				store.save([token()]);
+				expect(statSync(filePath).mode & 0o777).toBe(0o600);
+
+				process.env.CYRUS_GITHUB_TOKEN_STORE_MODE = "rw-r-----";
+				store.save([token()]);
+				expect(statSync(filePath).mode & 0o777).toBe(0o600);
+			} finally {
+				if (previous === undefined) {
+					delete process.env.CYRUS_GITHUB_TOKEN_STORE_MODE;
+				} else {
+					process.env.CYRUS_GITHUB_TOKEN_STORE_MODE = previous;
+				}
+			}
+		});
+
 		it("does not leave a temp file behind", () => {
 			store.save([token()]);
 			expect(existsSync(join(cyrusHome, "github-tokens.json.tmp"))).toBe(false);

@@ -23,6 +23,10 @@ function buildConfig(
 		getDefaultFallbackModelForRunner: () => "sonnet",
 		getDefaultEffortForRunner: (runnerType) =>
 			runnerType === "claude" ? defaultEffort : undefined,
+		getExecutableOverridesForRunner: (runnerType) =>
+			runnerType === "claude"
+				? { pathToClaudeCodeExecutable: "/opt/agent/claude" }
+				: {},
 	};
 	const builder = new RunnerConfigBuilder(
 		{ buildChatAllowedTools: () => [] },
@@ -67,6 +71,13 @@ describe("RunnerConfigBuilder effort", () => {
 		expect(buildConfig({ runnerType: "claude" }, "medium").effort).toBe(
 			"medium",
 		);
+	});
+
+	it("passes the configured Claude Code executable through", () => {
+		expect(
+			buildConfig({ runnerType: "claude" }, undefined)
+				.pathToClaudeCodeExecutable,
+		).toBe("/opt/agent/claude");
 	});
 
 	it("sets no effort when neither is configured", () => {

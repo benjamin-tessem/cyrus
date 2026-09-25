@@ -600,6 +600,12 @@
 		"global_teardown_script": {
 			"type": "string"
 		},
+		"claudeCodeExecutable": {
+			"type": "string"
+		},
+		"codexExecutable": {
+			"type": "string"
+		},
 		"linearAllowedTools": {
 			"type": "array",
 			"items": {

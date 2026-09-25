@@ -67,6 +67,26 @@ describe("RunnerSelectionService", () => {
 		expect(selection.effortOverride).toBeUndefined();
 	});
 
+	it("maps claudeCodeExecutable and codexExecutable onto their runners", () => {
+		const service = new RunnerSelectionService({
+			claudeCodeExecutable: "/opt/agent/claude",
+			codexExecutable: "/opt/agent/codex",
+		} as EdgeWorkerConfig);
+
+		expect(service.getExecutableOverridesForRunner("claude")).toEqual({
+			pathToClaudeCodeExecutable: "/opt/agent/claude",
+		});
+		expect(service.getExecutableOverridesForRunner("codex")).toEqual({
+			codexPath: "/opt/agent/codex",
+		});
+		expect(service.getExecutableOverridesForRunner("gemini")).toEqual({});
+		expect(
+			new RunnerSelectionService(
+				{} as EdgeWorkerConfig,
+			).getExecutableOverridesForRunner("claude"),
+		).toEqual({});
+	});
+
 	it("resolves claudeDefaultEffort for the Claude runner only", () => {
 		const service = new RunnerSelectionService({
 			claudeDefaultEffort: "medium",

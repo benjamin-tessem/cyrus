@@ -33,6 +33,8 @@ const RELOAD_MERGED_KEYS = [
 	"stripeCustomerId",
 	"global_setup_script",
 	"global_teardown_script",
+	"claudeCodeExecutable",
+	"codexExecutable",
 	"linearWorkspaces",
 	"claudeDefaultModel",
 	"claudeDefaultFallbackModel",
@@ -386,6 +388,10 @@ export class ConfigManager extends EventEmitter {
 				global_teardown_script:
 					parsedConfig.global_teardown_script ??
 					this.config.global_teardown_script,
+				claudeCodeExecutable:
+					parsedConfig.claudeCodeExecutable ?? this.config.claudeCodeExecutable,
+				codexExecutable:
+					parsedConfig.codexExecutable ?? this.config.codexExecutable,
 				// Sandbox / egress proxy config
 				sandbox: parsedConfig.sandbox ?? this.config.sandbox,
 			};

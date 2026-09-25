@@ -71,6 +71,22 @@ export class RunnerSelectionService {
 	}
 
 	/**
+	 * Runner-specific overrides for which CLI to launch (claudeCodeExecutable,
+	 * codexExecutable), in the shape each runner's config expects.
+	 */
+	public getExecutableOverridesForRunner(
+		runnerType: RunnerType,
+	): Record<string, string> {
+		if (runnerType === "claude" && this.config.claudeCodeExecutable) {
+			return { pathToClaudeCodeExecutable: this.config.claudeCodeExecutable };
+		}
+		if (runnerType === "codex" && this.config.codexExecutable) {
+			return { codexPath: this.config.codexExecutable };
+		}
+		return {};
+	}
+
+	/**
 	 * Resolve the default reasoning effort. Only the Claude runner takes one.
 	 */
 	public getDefaultEffortForRunner(

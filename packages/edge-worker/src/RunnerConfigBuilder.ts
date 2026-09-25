@@ -69,6 +69,9 @@ export interface IRunnerSelector {
 	getDefaultEffortForRunner?(
 		runnerType: RunnerType,
 	): AgentRunnerConfig["effort"] | undefined;
+	getExecutableOverridesForRunner?(
+		runnerType: RunnerType,
+	): Record<string, string>;
 }
 
 /**
@@ -308,6 +311,7 @@ export class RunnerConfigBuilder {
 
 		return {
 			runnerType,
+			...this.runnerSelector.getExecutableOverridesForRunner?.(runnerType),
 			workingDirectory: input.workspacePath,
 			allowedTools,
 			disallowedTools: [] as string[],
@@ -468,6 +472,7 @@ export class RunnerConfigBuilder {
 		).filter((p): p is string => typeof p === "string" && p !== cwd);
 
 		const config: AgentRunnerConfig & Record<string, unknown> = {
+			...this.runnerSelector.getExecutableOverridesForRunner?.(runnerType),
 			workingDirectory: cwd,
 			allowedTools: input.allowedTools,
 			disallowedTools: input.disallowedTools,

@@ -114,6 +114,8 @@ describe("WorkerService", () => {
 			defaultFallbackModel: "legacy-fallback",
 			global_setup_script: "~/setup.sh",
 			global_teardown_script: "~/teardown.sh",
+			claudeCodeExecutable: "/opt/agent/claude",
+			codexExecutable: "/opt/agent/codex",
 			linearAllowedTools: ["Read"],
 			defaultAllowedTools: ["Edit"],
 			defaultDisallowedTools: ["WebSearch"],
