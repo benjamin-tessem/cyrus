@@ -51,6 +51,7 @@ export type {
 	GitHubIssueCommentPayload,
 	GitHubPullRequest,
 	GitHubPullRequestMinimal,
+	GitHubPullRequestPayload,
 	GitHubPullRequestRef,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
@@ -62,3 +63,4 @@ export type {
 	GitHubVerificationMode,
 	GitHubWebhookEvent,
 } from "./types.js";
+export { FORWARDED_PULL_REQUEST_ACTIONS } from "./types.js";

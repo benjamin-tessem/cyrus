@@ -52,7 +52,8 @@ export interface GitHubWebhookEvent {
 		| GitHubPullRequestReviewCommentPayload
 		| GitHubPullRequestReviewPayload
 		| GitHubPushPayload
-		| GitHubCheckSuitePayload;
+		| GitHubCheckSuitePayload
+		| GitHubPullRequestPayload;
 	/** GitHub installation token forwarded from CYHOST (1-hour expiry) */
 	installationToken?: string;
 }
@@ -65,14 +66,16 @@ export type GitHubEventType =
 	| "pull_request_review_comment"
 	| "pull_request_review"
 	| "push"
-	| "check_suite";
+	| "check_suite"
+	| "pull_request";
 
 /**
- * Comment-related GitHub event types (excludes push and check_suite)
+ * Comment-related GitHub event types (excludes push, check_suite and
+ * pull_request)
  */
 export type GitHubCommentEventType = Exclude<
 	GitHubEventType,
-	"push" | "check_suite"
+	"push" | "check_suite" | "pull_request"
 >;
 
 /**
@@ -317,6 +320,34 @@ export interface GitHubCheckSuitePayload {
 		pull_requests: GitHubCheckSuitePullRequest[];
 		app?: { slug?: string; name?: string };
 	};
+	repository: GitHubRepository;
+	sender: GitHubUser;
+	installation?: GitHubInstallation;
+}
+
+/**
+ * `pull_request` actions that are forwarded: the ones after which the PR's
+ * mergeability may have changed (new head commit, reopened, base changed).
+ */
+export const FORWARDED_PULL_REQUEST_ACTIONS = [
+	"opened",
+	"reopened",
+	"synchronize",
+	"ready_for_review",
+	"edited",
+] as const;
+
+/**
+ * Payload for pull_request webhook events (minimal). Used to check a PR
+ * opened by a Cyrus agent for merge conflicts with its base branch.
+ * @see https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request
+ */
+export interface GitHubPullRequestPayload {
+	action: string;
+	number: number;
+	pull_request: GitHubPullRequest & { draft?: boolean; merged?: boolean };
+	/** For `edited`: what changed (a new base branch shows up as `base`) */
+	changes?: { base?: unknown; title?: unknown; body?: unknown };
 	repository: GitHubRepository;
 	sender: GitHubUser;
 	installation?: GitHubInstallation;

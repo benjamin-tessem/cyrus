@@ -103,6 +103,7 @@ import {
 	GitHubCommentService,
 	type GitHubCommentWebhookEvent,
 	GitHubEventTransport,
+	type GitHubPullRequestPayload,
 	type GitHubPushPayload,
 	type GitHubWebhookEvent,
 	isCommentOnPullRequest,
@@ -174,6 +175,14 @@ import { EgressProxy } from "./EgressProxy.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
+import {
+	conflictKey,
+	MAX_NOTIFIED_CONFLICTS,
+	MERGE_CONFLICT_SWEEP_INTERVAL_MS,
+	MERGEABLE_RETRY_DELAYS_MS,
+	mergeConflictPrompt,
+	repoFullNameFromGitHubUrl,
+} from "./MergeConflictNotifier.js";
 import { PromptBuilder } from "./PromptBuilder.js";
 import type {
 	IssueContextResult,
@@ -342,6 +351,20 @@ export class EdgeWorker extends EventEmitter {
 	private ciFailureNotifiedShas = new NotifiedShaSet();
 	/** Missing GitHub App permissions already warned about, by API. */
 	private ciPermissionWarnings = new Set<string>();
+
+	/**
+	 * Merge conflicts already reported to the session that owns the PR, as
+	 * (head sha, base sha) pairs, across restarts too. See
+	 * MergeConflictNotifier.ts.
+	 */
+	private mergeConflictNotified = new NotifiedShaSet(MAX_NOTIFIED_CONFLICTS);
+	/** PRs (`owner/repo#n`) with a merge-conflict check under way. */
+	private mergeConflictChecksInFlight = new Set<string>();
+	/** Fallback sweep of Cyrus-owned open PRs for merge conflicts. */
+	private mergeConflictSweepTimer: ReturnType<typeof setInterval> | null = null;
+	private mergeConflictSweepRunning = false;
+	/** Waits before re-reading a PR whose mergeability GitHub hasn't computed. */
+	private mergeableRetryDelaysMs: readonly number[] = MERGEABLE_RETRY_DELAYS_MS;
 
 	/**
 	 * Sessions parked due to blocked-by dependencies.
@@ -722,6 +745,10 @@ export class EdgeWorker extends EventEmitter {
 
 		// Load persisted state for each repository
 		await this.loadPersistedState();
+
+		// Fallback check of agents' PRs for merge conflicts, for missed
+		// push / pull_request webhooks. See MergeConflictNotifier.ts.
+		this.startMergeConflictSweep();
 
 		// Pre-warm the 30 most recent Claude sessions in the background
 		// so their first query after restart has near-zero cold-start latency.
@@ -1207,6 +1234,21 @@ export class EdgeWorker extends EventEmitter {
 						);
 					},
 				);
+				this.checkMergeConflictsAfterPush(event).catch((error) => {
+					this.logger.error(
+						"Failed to check pull requests for merge conflicts after a push",
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
+				return;
+			}
+			if (event.eventType === "pull_request") {
+				this.handleGitHubPullRequestWebhook(event).catch((error) => {
+					this.logger.error(
+						"Failed to handle GitHub pull_request webhook",
+						error instanceof Error ? error : new Error(String(error)),
+					);
+				});
 				return;
 			}
 			if (event.eventType === "check_suite") {
@@ -1562,7 +1604,7 @@ export class EdgeWorker extends EventEmitter {
 	 * 4. Personal access token from GITHUB_TOKEN env var (fallback)
 	 */
 	private async resolveGitHubToken(
-		event: GitHubWebhookEvent,
+		event: Pick<GitHubWebhookEvent, "installationToken"> | undefined,
 		repository?: RepositoryConfig,
 	): Promise<string | undefined> {
 		if (repository?.githubUrl) {
@@ -1571,7 +1613,7 @@ export class EdgeWorker extends EventEmitter {
 			);
 			if (storedToken) return storedToken;
 		}
-		if (event.installationToken) return event.installationToken;
+		if (event?.installationToken) return event.installationToken;
 		if (this.gitHubAppTokenProvider) {
 			try {
 				return await this.gitHubAppTokenProvider.getToken();
@@ -2367,16 +2409,357 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 		what: string,
 		permission: string,
 		status: number,
+		feature = "CI failure notifications",
 	): void {
 		if (status !== 403 && status !== 404) {
 			this.logger.warn(`Could not read ${what} from GitHub: HTTP ${status}`);
 			return;
 		}
-		if (this.ciPermissionWarnings.has(what)) return;
-		this.ciPermissionWarnings.add(what);
+		const key = `${feature}:${what}`;
+		if (this.ciPermissionWarnings.has(key)) return;
+		this.ciPermissionWarnings.add(key);
 		this.logger.warn(
-			`Could not read ${what} from GitHub (HTTP ${status}). CI failure notifications need the GitHub App's "${permission}" permission; grant it and accept the new permissions on the installation.`,
+			`Could not read ${what} from GitHub (HTTP ${status}). ${feature} need the GitHub App's "${permission}" permission; grant it and accept the new permissions on the installation.`,
 		);
+	}
+
+	// ------------------------------------------------------------------
+	// Merge conflicts on agents' PRs (see MergeConflictNotifier.ts)
+	// ------------------------------------------------------------------
+
+	/**
+	 * A push to a branch: check the Cyrus-owned open PRs based on it (the
+	 * usual way a PR starts conflicting) and, when the branch itself belongs
+	 * to a Cyrus session, its own open PR.
+	 */
+	private async checkMergeConflictsAfterPush(
+		event: GitHubWebhookEvent,
+	): Promise<void> {
+		const payload = event.payload as GitHubPushPayload;
+		if (!payload.ref?.startsWith("refs/heads/") || payload.deleted) return;
+		const branch = payload.ref.slice("refs/heads/".length);
+		const repoFullName = payload.repository?.full_name;
+		if (!repoFullName) return;
+		const repository = this.findRepositoryByGitHubUrl(repoFullName);
+		if (!repository) return;
+
+		const token = await this.resolveGitHubToken(event, repository);
+		const pulls =
+			(await this.listOpenPullRequests(
+				repoFullName,
+				`base=${encodeURIComponent(branch)}`,
+				token,
+			)) ?? [];
+		if (this.findSessionOwningBranch(branch, repository)) {
+			const owner = repoFullName.split("/")[0];
+			const own = await this.listOpenPullRequests(
+				repoFullName,
+				`head=${encodeURIComponent(`${owner}:${branch}`)}`,
+				token,
+			);
+			pulls.push(...(own ?? []));
+		}
+
+		const seen = new Set<number>();
+		for (const pr of pulls) {
+			if (seen.has(pr.number)) continue;
+			seen.add(pr.number);
+			if (!this.isOwnedPullRequest(pr, repoFullName, repository)) continue;
+			await this.checkPullRequestForConflicts(
+				repoFullName,
+				repository,
+				pr.number,
+				token,
+			).catch((error) => {
+				this.logger.warn(
+					`Merge conflict check failed for ${repoFullName}#${pr.number}`,
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			});
+		}
+	}
+
+	/**
+	 * A pull_request event (new head commit, reopened, new base...): check
+	 * that PR when a Cyrus session owns its branch.
+	 */
+	private async handleGitHubPullRequestWebhook(
+		event: GitHubWebhookEvent,
+	): Promise<void> {
+		const payload = event.payload as GitHubPullRequestPayload;
+		const pr = payload.pull_request;
+		const repoFullName = payload.repository?.full_name;
+		if (!pr || !repoFullName || pr.state !== "open") return;
+		// Only a new base can change mergeability among the edits.
+		if (payload.action === "edited" && !payload.changes?.base) return;
+		const repository = this.findRepositoryByGitHubUrl(repoFullName);
+		if (!repository) return;
+		if (!this.isOwnedPullRequest(pr, repoFullName, repository)) return;
+
+		const token = await this.resolveGitHubToken(event, repository);
+		await this.checkPullRequestForConflicts(
+			repoFullName,
+			repository,
+			pr.number,
+			token,
+		);
+	}
+
+	/**
+	 * Every Cyrus-owned open PR in every configured GitHub repository, as a
+	 * fallback for missed webhooks. One sweep at a time.
+	 */
+	private async sweepMergeConflicts(): Promise<void> {
+		if (this.mergeConflictSweepRunning) return;
+		this.mergeConflictSweepRunning = true;
+		try {
+			const repos = new Map<string, RepositoryConfig>();
+			for (const repository of this.repositories.values()) {
+				const fullName = repoFullNameFromGitHubUrl(repository.githubUrl);
+				if (fullName && !repos.has(fullName)) repos.set(fullName, repository);
+			}
+			for (const [repoFullName, repository] of repos) {
+				const token = await this.resolveGitHubToken(undefined, repository);
+				if (!token) {
+					this.logger.debug(
+						`Merge conflict sweep: no GitHub token for ${repoFullName}; skipping`,
+					);
+					continue;
+				}
+				const pulls = await this.listOpenPullRequests(repoFullName, "", token);
+				for (const pr of pulls ?? []) {
+					if (!this.isOwnedPullRequest(pr, repoFullName, repository)) continue;
+					await this.checkPullRequestForConflicts(
+						repoFullName,
+						repository,
+						pr.number,
+						token,
+					).catch((error) => {
+						this.logger.warn(
+							`Merge conflict check failed for ${repoFullName}#${pr.number}`,
+							error instanceof Error ? error : new Error(String(error)),
+						);
+					});
+				}
+			}
+		} finally {
+			this.mergeConflictSweepRunning = false;
+		}
+	}
+
+	private startMergeConflictSweep(): void {
+		if (this.mergeConflictSweepTimer) return;
+		this.mergeConflictSweepTimer = setInterval(() => {
+			this.sweepMergeConflicts().catch((error) => {
+				this.logger.warn(
+					"Merge conflict sweep failed",
+					error instanceof Error ? error : new Error(String(error)),
+				);
+			});
+		}, MERGE_CONFLICT_SWEEP_INTERVAL_MS);
+		this.mergeConflictSweepTimer.unref?.();
+	}
+
+	private stopMergeConflictSweep(): void {
+		if (!this.mergeConflictSweepTimer) return;
+		clearInterval(this.mergeConflictSweepTimer);
+		this.mergeConflictSweepTimer = null;
+	}
+
+	private findSessionOwningBranch(
+		branch: string,
+		repository: RepositoryConfig,
+	): CyrusAgentSession | null {
+		return findSessionForBranch(
+			this.agentSessionManager.getAllSessions(),
+			branch,
+			repository.id,
+			(sessionId) => this.sessionRepositories.get(sessionId),
+		);
+	}
+
+	/** A PR from this repository (not a fork) whose branch a session owns. */
+	private isOwnedPullRequest(
+		pr: { head?: { ref?: string; repo?: { full_name?: string } | null } },
+		repoFullName: string,
+		repository: RepositoryConfig,
+	): boolean {
+		const headRef = pr.head?.ref;
+		if (!headRef) return false;
+		const headRepo = pr.head?.repo?.full_name;
+		if (headRepo && headRepo.toLowerCase() !== repoFullName.toLowerCase()) {
+			return false;
+		}
+		return Boolean(this.findSessionOwningBranch(headRef, repository)?.issue);
+	}
+
+	/**
+	 * Open PRs in a repository, filtered by a pulls API query (`base=...`,
+	 * `head=...`). Null when they can't be read.
+	 */
+	private async listOpenPullRequests(
+		repoFullName: string,
+		query: string,
+		token: string | undefined,
+	): Promise<Array<{
+		number: number;
+		head?: { ref?: string; repo?: { full_name?: string } | null };
+	}> | null> {
+		const pulls: Array<{
+			number: number;
+			head?: { ref?: string; repo?: { full_name?: string } | null };
+		}> = [];
+		for (let page = 1; page <= 5; page++) {
+			const response = await this.githubApiGet(
+				`/repos/${repoFullName}/pulls?state=open${query ? `&${query}` : ""}&per_page=100&page=${page}`,
+				token,
+			);
+			if (!response) return null;
+			if (!response.ok) {
+				this.warnCiApiFailure(
+					"pull requests",
+					"Pull requests: read",
+					response.status,
+					"Merge conflict notifications",
+				);
+				return null;
+			}
+			const batch = (await response.json()) as typeof pulls;
+			pulls.push(...batch);
+			if (batch.length < 100) break;
+		}
+		return pulls;
+	}
+
+	/** One PR from the pulls API, including its mergeability. */
+	private async fetchPullRequest(
+		repoFullName: string,
+		prNumber: number,
+		token: string | undefined,
+	): Promise<{
+		number: number;
+		state: string;
+		merged?: boolean;
+		mergeable: boolean | null;
+		head: { ref: string; sha: string };
+		base: { ref: string; sha: string };
+	} | null> {
+		const response = await this.githubApiGet(
+			`/repos/${repoFullName}/pulls/${prNumber}`,
+			token,
+		);
+		if (!response) return null;
+		if (!response.ok) {
+			this.warnCiApiFailure(
+				"pull requests",
+				"Pull requests: read",
+				response.status,
+				"Merge conflict notifications",
+			);
+			return null;
+		}
+		const pr = (await response.json()) as {
+			number: number;
+			state: string;
+			merged?: boolean;
+			mergeable?: boolean | null;
+			head: { ref: string; sha: string };
+			base: { ref: string; sha: string };
+		};
+		return { ...pr, mergeable: pr.mergeable ?? null };
+	}
+
+	/** The commit a branch points at, or null when it can't be read. */
+	private async fetchBranchSha(
+		repoFullName: string,
+		branch: string,
+		token: string | undefined,
+	): Promise<string | null> {
+		const ref = branch.split("/").map(encodeURIComponent).join("/");
+		const response = await this.githubApiGet(
+			`/repos/${repoFullName}/git/ref/heads/${ref}`,
+			token,
+		);
+		if (!response?.ok) return null;
+		const data = (await response.json()) as { object?: { sha?: string } };
+		return data.object?.sha ?? null;
+	}
+
+	/**
+	 * Read a PR's mergeability (waiting a little while GitHub computes it)
+	 * and, when it conflicts with its base, prompt the session that owns its
+	 * branch — once per (head, base) commit pair.
+	 */
+	private async checkPullRequestForConflicts(
+		repoFullName: string,
+		repository: RepositoryConfig,
+		prNumber: number,
+		token: string | undefined,
+	): Promise<void> {
+		const inFlightKey = `${repoFullName}#${prNumber}`;
+		if (this.mergeConflictChecksInFlight.has(inFlightKey)) return;
+		this.mergeConflictChecksInFlight.add(inFlightKey);
+		try {
+			let pr = await this.fetchPullRequest(repoFullName, prNumber, token);
+			for (const delay of this.mergeableRetryDelaysMs) {
+				if (!pr || pr.state !== "open" || pr.mergeable !== null) break;
+				await new Promise((resolve) => setTimeout(resolve, delay));
+				pr = await this.fetchPullRequest(repoFullName, prNumber, token);
+			}
+			if (!pr || pr.state !== "open" || pr.merged) return;
+			if (pr.mergeable === null) {
+				this.logger.debug(
+					`${repoFullName}#${prNumber}: GitHub is still computing mergeability; the next push or sweep will look again`,
+				);
+				return;
+			}
+			if (pr.mergeable) return;
+
+			const session = this.findSessionOwningBranch(pr.head.ref, repository);
+			if (!session?.issue) return;
+
+			const baseSha =
+				(await this.fetchBranchSha(repoFullName, pr.base.ref, token)) ??
+				pr.base.sha;
+			const key = conflictKey(pr.head.sha, baseSha);
+			if (this.mergeConflictNotified.has(key)) return;
+
+			const linearWorkspaceId = this.linearWorkspaceForSession(
+				session.id,
+				session.issue.id,
+			);
+			if (!linearWorkspaceId) {
+				this.logger.warn(
+					`${repoFullName}#${prNumber} has merge conflicts but ${session.issue.identifier} has no Linear workspace; not notifying`,
+				);
+				return;
+			}
+
+			this.mergeConflictNotified.add(key);
+			await this.savePersistedState();
+			this.logger.info(
+				`${repoFullName}#${prNumber} has merge conflicts with ${pr.base.ref} (${baseSha.slice(0, 7)}) — prompting ${session.issue.identifier}`,
+			);
+			try {
+				await this.promptSessionInternally(
+					session.id,
+					{
+						id: session.issue.id,
+						identifier: session.issue.identifier,
+						title: session.issue.title,
+					},
+					linearWorkspaceId,
+					mergeConflictPrompt(prNumber, pr.base.ref, baseSha),
+				);
+			} catch (error) {
+				// Let the next trigger try again.
+				this.mergeConflictNotified.delete(key);
+				await this.savePersistedState();
+				throw error;
+			}
+		} finally {
+			this.mergeConflictChecksInFlight.delete(inFlightKey);
+		}
 	}
 
 	/**
@@ -3327,6 +3710,8 @@ ${taskSection}`;
 	async stop(): Promise<void> {
 		this.selfHostedGitHubAppCredentials?.stop();
 		this.selfHostedGitHubAppCredentials = null;
+
+		this.stopMergeConflictSweep();
 
 		// Stop config file watcher
 		await this.configManager.stop();
@@ -7853,6 +8238,9 @@ ${input.userComment}
 			...(this.ciFailureNotifiedShas.size > 0 && {
 				ciFailureNotifiedShas: this.ciFailureNotifiedShas.toJSON(),
 			}),
+			...(this.mergeConflictNotified.size > 0 && {
+				mergeConflictNotifiedPairs: this.mergeConflictNotified.toJSON(),
+			}),
 		};
 	}
 
@@ -7865,6 +8253,9 @@ ${input.userComment}
 		}
 		if (state.ciFailureNotifiedShas) {
 			this.ciFailureNotifiedShas.restore(state.ciFailureNotifiedShas);
+		}
+		if (state.mergeConflictNotifiedPairs) {
+			this.mergeConflictNotified.restore(state.mergeConflictNotifiedPairs);
 		}
 
 		// Restore Agent Session state from flat format

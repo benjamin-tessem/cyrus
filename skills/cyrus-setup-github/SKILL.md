@@ -7,7 +7,7 @@ description: Configure GitHub for Cyrus — gh CLI login and git config for PRs,
 
 # Setup GitHub
 
-Configures GitHub CLI and git so Cyrus can create branches, commits, and pull requests. Optionally creates a GitHub App so Cyrus can receive and respond to @mentions in PR comments and reviews, automate rebases and merges, and fix CI failures on the PRs it opened.
+Configures GitHub CLI and git so Cyrus can create branches, commits, and pull requests. Optionally creates a GitHub App so Cyrus can receive and respond to @mentions in PR comments and reviews, automate rebases and merges, and fix CI failures and merge conflicts on the PRs it opened.
 
 ---
 
@@ -83,7 +83,7 @@ Ask the user:
 
 > **Do you want Cyrus to respond to GitHub @mentions in PR comments and reviews?**
 >
-> - **Yes — enable @mentions**: Creates a GitHub App so Cyrus can receive PR comments and reviews via webhooks, respond when @mentioned, act on "changes requested" reviews, and fix CI failures on its own PRs.
+> - **Yes — enable @mentions**: Creates a GitHub App so Cyrus can receive PR comments and reviews via webhooks, respond when @mentioned, act on "changes requested" reviews, and fix CI failures and merge conflicts on its own PRs.
 > - **No — PRs only**: Cyrus will create branches, commits, and PRs but won't respond to comments.
 
 If **No** → skip to Completion.
@@ -167,12 +167,16 @@ Construct the manifest, substituting `AGENT_NAME`, `HOMEPAGE_URL`, and `CYRUS_BA
     "pull_request_review",
     "pull_request_review_comment",
     "repository",
-    "check_suite"
+    "check_suite",
+    "pull_request",
+    "push"
   ]
 }
 ```
 
 **CI failure notifications:** `check_suite` plus `checks: read` let Cyrus notice when every check on a PR it opened has finished and one failed, and prompt the agent that owns the branch to fix it (once per head commit). `statuses: read` includes legacy commit statuses in that verdict, and `actions: read` lets the agent read the failed run's logs with `gh run view --log-failed`. For an App created before this, add those permissions and the **Check suite** event under the App's *Permissions & events* settings, then accept the new permissions on the installation. Without Checks access Cyrus logs one warning and otherwise ignores CI.
+
+**Merge conflict notifications:** when a PR Cyrus opened starts conflicting with its base branch (usually because the base branch moved), Cyrus prompts the agent that owns the branch to update the branch, resolve the conflicts and push — once per head/base commit pair. It checks on `push` (to the PR's base or head branch) and `pull_request` (opened, reopened, synchronize, ready for review, base changed) webhooks, and every 20 minutes sweeps the open PRs of the configured repositories as a fallback. It reads PRs with `pull_requests` access (read is enough) and base branch tips with `contents` access (read is enough); `push` events need Contents access and `pull_request` events need Pull requests access. For an App created before this, subscribe to the **Push** and **Pull request** events under *Permissions & events*. Without those events the periodic sweep still finds conflicts, just later; without Pull requests access Cyrus logs one warning and otherwise ignores merge conflicts.
 
 **Note:** `redirect_url` is required by GitHub's manifest flow. The actual redirect will include a `?code=` parameter appended to this URL — the code is what matters, not the destination page.
 

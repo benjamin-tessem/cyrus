@@ -10,12 +10,14 @@ import type {
 	GitHubEventTransportEvents,
 	GitHubEventType,
 	GitHubIssueCommentPayload,
+	GitHubPullRequestPayload,
 	GitHubPullRequestReviewCommentPayload,
 	GitHubPullRequestReviewPayload,
 	GitHubPushPayload,
 	GitHubVerificationMode,
 	GitHubWebhookEvent,
 } from "./types.js";
+import { FORWARDED_PULL_REQUEST_ACTIONS } from "./types.js";
 
 export declare interface GitHubEventTransport {
 	on<K extends keyof GitHubEventTransportEvents>(
@@ -46,6 +48,8 @@ export declare interface GitHubEventTransport {
  * - push: Branch push events (used for base branch change notifications)
  * - check_suite (completed): CI finished for a commit (used to tell the
  *   agent that owns the branch when its PR's checks fail)
+ * - pull_request (opened, reopened, synchronize, ready_for_review, edited):
+ *   used to check an agent's PR for merge conflicts with its base branch
  */
 export class GitHubEventTransport extends EventEmitter {
 	private config: GitHubEventTransportConfig;
@@ -247,7 +251,8 @@ export class GitHubEventTransport extends EventEmitter {
 			eventType !== "pull_request_review_comment" &&
 			eventType !== "pull_request_review" &&
 			eventType !== "push" &&
-			eventType !== "check_suite"
+			eventType !== "check_suite" &&
+			eventType !== "pull_request"
 		) {
 			this.logger.debug(`Ignoring unsupported event type: ${eventType}`);
 			reply.code(200).send({ success: true, ignored: true });
@@ -259,7 +264,8 @@ export class GitHubEventTransport extends EventEmitter {
 			| GitHubPullRequestReviewCommentPayload
 			| GitHubPullRequestReviewPayload
 			| GitHubPushPayload
-			| GitHubCheckSuitePayload;
+			| GitHubCheckSuitePayload
+			| GitHubPullRequestPayload;
 
 		// Push events don't have an action field — always emit them
 		if (eventType === "push") {
@@ -270,6 +276,15 @@ export class GitHubEventTransport extends EventEmitter {
 				this.logger.debug(
 					`Ignoring ${eventType} with action: ${(payload as GitHubCheckSuitePayload).action}`,
 				);
+				reply.code(200).send({ success: true, ignored: true });
+				return;
+			}
+		} else if (eventType === "pull_request") {
+			const action = (payload as GitHubPullRequestPayload).action;
+			if (
+				!(FORWARDED_PULL_REQUEST_ACTIONS as readonly string[]).includes(action)
+			) {
+				this.logger.debug(`Ignoring ${eventType} with action: ${action}`);
 				reply.code(200).send({ success: true, ignored: true });
 				return;
 			}

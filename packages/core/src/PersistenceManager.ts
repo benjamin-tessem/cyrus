@@ -97,6 +97,10 @@ export interface SerializableEdgeWorkerState {
 	// that owns the PR, oldest first and capped, so a restart doesn't report
 	// them again.
 	ciFailureNotifiedShas?: string[];
+	// Merge conflicts already reported to the session that owns the PR, as
+	// "<head sha>:<base sha>" pairs, oldest first and capped, so a restart
+	// doesn't report them again.
+	mergeConflictNotifiedPairs?: string[];
 }
 
 /**

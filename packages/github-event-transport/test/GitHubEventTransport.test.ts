@@ -486,6 +486,55 @@ describe("GitHubEventTransport", () => {
 			expect(eventListener).not.toHaveBeenCalled();
 		});
 
+		it("processes pull_request events whose mergeability may have changed", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{
+					action: "synchronize",
+					number: 7,
+					pull_request: { number: 7, state: "open" },
+				},
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "pull_request",
+					"x-github-delivery": "delivery-pr",
+				},
+			);
+			const reply = createMockReply();
+
+			await mockFastify.routes["/github-webhook"]!(request, reply);
+
+			expect(reply.send).toHaveBeenCalledWith({ success: true });
+			expect(eventListener).toHaveBeenCalledWith(
+				expect.objectContaining({
+					eventType: "pull_request",
+					deliveryId: "delivery-pr",
+				}),
+			);
+		});
+
+		it("ignores other pull_request actions", async () => {
+			const eventListener = vi.fn();
+			transport.on("event", eventListener);
+
+			const request = createMockRequest(
+				{ action: "labeled", number: 7, pull_request: { number: 7 } },
+				{
+					authorization: `Bearer ${testSecret}`,
+					"x-github-event": "pull_request",
+					"x-github-delivery": "delivery-pr",
+				},
+			);
+			const reply = createMockReply();
+
+			await mockFastify.routes["/github-webhook"]!(request, reply);
+
+			expect(reply.send).toHaveBeenCalledWith({ success: true, ignored: true });
+			expect(eventListener).not.toHaveBeenCalled();
+		});
+
 		it("extracts installation token from X-GitHub-Installation-Token header", async () => {
 			const eventListener = vi.fn();
 			transport.on("event", eventListener);
