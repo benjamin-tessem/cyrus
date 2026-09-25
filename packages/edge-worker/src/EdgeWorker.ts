@@ -2286,6 +2286,15 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 			return;
 		}
 
+		if (!(await this.isIssueStillCyrus(linearWorkspaceId, session.issue.id))) {
+			this.logger.info(
+				`CI failed on ${repoFullName}#${pr.number}, but ${session.issue.identifier} is no longer delegated to Cyrus (or is closed); not prompting`,
+			);
+			return;
+		}
+		// And again after that await, so concurrent suites prompt once.
+		if (this.ciFailureNotifiedShas.has(headSha)) return;
+
 		this.ciFailureNotifiedShas.add(headSha);
 		await this.savePersistedState();
 		this.logger.info(
@@ -2759,6 +2768,16 @@ Your base branch \`${branchName}\` has received ${commitCount} new commit(s). Co
 				);
 				return;
 			}
+
+			if (
+				!(await this.isIssueStillCyrus(linearWorkspaceId, session.issue.id))
+			) {
+				this.logger.info(
+					`${repoFullName}#${prNumber} has merge conflicts, but ${session.issue.identifier} is no longer delegated to Cyrus (or is closed); not prompting`,
+				);
+				return;
+			}
+			if (this.mergeConflictNotified.has(key)) return;
 
 			this.mergeConflictNotified.add(key);
 			await this.savePersistedState();
@@ -4490,6 +4509,47 @@ ${taskSection}`;
 				},
 			},
 		);
+	}
+
+	/** Cyrus's own Linear user per workspace, for delegation checks. */
+	private linearAppUserIds = new Map<string, string>();
+
+	/**
+	 * Whether Cyrus should still act on an issue on its own initiative (CI and
+	 * merge-conflict prompts): it is still delegated or assigned to Cyrus and
+	 * not completed or canceled. Unassigning a ticket must stop Cyrus from
+	 * resuming it, not just stop the current run. Any lookup failure counts as
+	 * "no", so an automatic prompt is never sent on a guess.
+	 */
+	private async isIssueStillCyrus(
+		linearWorkspaceId: string,
+		issueId: string,
+	): Promise<boolean> {
+		const tracker = this.getIssueTrackerForWorkspace(linearWorkspaceId);
+		if (!tracker) return false;
+		try {
+			let appUserId = this.linearAppUserIds.get(linearWorkspaceId);
+			if (!appUserId) {
+				appUserId = (await tracker.fetchCurrentUser()).id;
+				this.linearAppUserIds.set(linearWorkspaceId, appUserId);
+			}
+			const issue = (await tracker.fetchIssue(issueId)) as unknown as {
+				delegateId?: string | null;
+				assigneeId?: string | null;
+				state?: Promise<{ type?: string } | undefined>;
+			};
+			if (issue.delegateId !== appUserId && issue.assigneeId !== appUserId) {
+				return false;
+			}
+			const state = await issue.state;
+			return state?.type !== "completed" && state?.type !== "canceled";
+		} catch (error) {
+			this.logger.warn(
+				`Could not check whether issue ${issueId} is still Cyrus's; not prompting`,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			return false;
+		}
 	}
 
 	/**

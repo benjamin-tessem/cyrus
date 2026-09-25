@@ -250,7 +250,21 @@ describe("EdgeWorker - merge conflict notifications", () => {
 		const prompted = vi
 			.spyOn(worker as any, "handleUserPromptedAgentActivity")
 			.mockResolvedValue(undefined);
-		return { worker, prompted };
+		// Linear still has the issue delegated to Cyrus unless a test says
+		// otherwise.
+		const linear = {
+			delegateId: "app-user" as string | null,
+			stateType: "started",
+		};
+		(worker as any).issueTrackers.set("test-workspace", {
+			fetchCurrentUser: vi.fn().mockResolvedValue({ id: "app-user" }),
+			fetchIssue: vi.fn(async () => ({
+				delegateId: linear.delegateId,
+				assigneeId: null,
+				state: Promise.resolve({ type: linear.stateType }),
+			})),
+		});
+		return { worker, prompted, linear };
 	}
 
 	function promptBodies(prompted: any): string[] {
@@ -258,6 +272,25 @@ describe("EdgeWorker - merge conflict notifications", () => {
 			([webhook]: any[]) => webhook.agentActivity.content.body,
 		);
 	}
+
+	it("doesn't prompt once the issue is unassigned from Cyrus or closed", async () => {
+		githubApi();
+		const { worker, prompted, linear } = makeWorker();
+
+		linear.delegateId = null;
+		await (worker as any).handleGitHubPullRequestWebhook(pullRequestEvent());
+		expect(prompted).not.toHaveBeenCalled();
+
+		linear.delegateId = "app-user";
+		linear.stateType = "completed";
+		await (worker as any).handleGitHubPullRequestWebhook(pullRequestEvent());
+		expect(prompted).not.toHaveBeenCalled();
+
+		// Handed back to Cyrus: the same conflict is reported after all.
+		linear.stateType = "started";
+		await (worker as any).handleGitHubPullRequestWebhook(pullRequestEvent());
+		expect(prompted).toHaveBeenCalledTimes(1);
+	});
 
 	it("prompts the owning session when its PR conflicts", async () => {
 		const fetchMock = githubApi();

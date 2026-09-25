@@ -207,8 +207,44 @@ describe("EdgeWorker - CI failure notifications", () => {
 		const prompted = vi
 			.spyOn(worker as any, "handleUserPromptedAgentActivity")
 			.mockResolvedValue(undefined);
-		return { worker, prompted };
+		// Linear still has the issue delegated to Cyrus unless a test says
+		// otherwise.
+		const linear = {
+			delegateId: "app-user" as string | null,
+			stateType: "started",
+		};
+		(worker as any).issueTrackers.set("test-workspace", {
+			fetchCurrentUser: vi.fn().mockResolvedValue({ id: "app-user" }),
+			fetchIssue: vi.fn(async () => ({
+				delegateId: linear.delegateId,
+				assigneeId: null,
+				state: Promise.resolve({ type: linear.stateType }),
+			})),
+		});
+		return { worker, prompted, linear };
 	}
+
+	it("doesn't prompt once the issue is unassigned from Cyrus or closed", async () => {
+		githubReturns(
+			[{ name: "test", status: "completed", conclusion: "failure" }],
+			[],
+		);
+		const { worker, prompted, linear } = makeWorker();
+
+		linear.delegateId = null;
+		await (worker as any).handleGitHubCheckSuiteWebhook(checkSuiteEvent());
+		expect(prompted).not.toHaveBeenCalled();
+
+		linear.delegateId = "app-user";
+		linear.stateType = "canceled";
+		await (worker as any).handleGitHubCheckSuiteWebhook(checkSuiteEvent());
+		expect(prompted).not.toHaveBeenCalled();
+
+		// Handed back to Cyrus: the same red commit is reported after all.
+		linear.stateType = "started";
+		await (worker as any).handleGitHubCheckSuiteWebhook(checkSuiteEvent());
+		expect(prompted).toHaveBeenCalledTimes(1);
+	});
 
 	it("prompts the owning session when checks finished red", async () => {
 		const fetchMock = githubReturns(
