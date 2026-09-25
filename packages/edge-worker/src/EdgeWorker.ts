@@ -41,6 +41,7 @@ import type {
 	InternalMessage,
 	Issue,
 	IssueMinimal,
+	IssueNewCommentWebhook,
 	IssueStateChangeMessage,
 	IssueUnassignedWebhook,
 	IssueUpdateWebhook,
@@ -174,6 +175,13 @@ import { DefaultSkillsDeployer } from "./DefaultSkillsDeployer.js";
 import { EgressProxy } from "./EgressProxy.js";
 import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
+import {
+	type FetchedCommentFacts,
+	type IssueCommentNotification,
+	issueCommentReplyPrompt,
+	MAX_SEEN_ISSUE_COMMENTS,
+	newestLinearSession,
+} from "./IssueCommentReplies.js";
 import { McpConfigService } from "./McpConfigService.js";
 import {
 	conflictKey,
@@ -349,6 +357,12 @@ export class EdgeWorker extends EventEmitter {
 	 * CiFailureNotifier.ts.
 	 */
 	private ciFailureNotifiedShas = new NotifiedShaSet();
+	/**
+	 * Linear comment ids already delivered to a session, as a thread reply
+	 * or as a plain issue comment, so no comment is delivered twice. See
+	 * IssueCommentReplies.ts.
+	 */
+	private seenIssueCommentIds = new NotifiedShaSet(MAX_SEEN_ISSUE_COMMENTS);
 	/** Missing GitHub App permissions already warned about, by API. */
 	private ciPermissionWarnings = new Set<string>();
 
@@ -936,15 +950,26 @@ export class EdgeWorker extends EventEmitter {
 		issue: { id: string; identifier: string; title: string },
 		linearWorkspaceId: string,
 		body: string,
+		fromComment?: {
+			commentId: string;
+			author: { id: string; name?: string; email?: string };
+		},
 	): Promise<void> {
 		await this.handleUserPromptedAgentActivity({
 			type: "AgentSessionEvent",
 			action: "prompted",
 			organizationId: linearWorkspaceId,
 			createdAt: new Date().toISOString(),
-			agentSession: { id: sessionId, issue },
+			agentSession: {
+				id: sessionId,
+				issue,
+				// The prompted handler checks access against the creator.
+				...(fromComment && { creator: fromComment.author }),
+			},
 			agentActivity: {
 				content: { type: "prompt", body },
+				// Lets the handler pick up the comment's attachments and author.
+				...(fromComment && { sourceCommentId: fromComment.commentId }),
 			},
 		} as unknown as AgentSessionPromptedWebhook);
 	}
@@ -4323,13 +4348,15 @@ ${taskSection}`;
 			} else if (isIssueCommentMentionWebhook(webhook)) {
 				return;
 			} else if (isIssueNewCommentWebhook(webhook)) {
-				return;
+				await this.handleIssueNewCommentWebhook(webhook);
 			} else if (isIssueUnassignedWebhook(webhook)) {
 				// Keep unassigned webhook active
 				await this.handleIssueUnassignedWebhook(webhook);
 			} else if (isAgentSessionCreatedWebhook(webhook)) {
+				this.markIssueCommentSeen(webhook.agentSession.comment?.id);
 				await this.handleAgentSessionCreatedWebhook(webhook, repos);
 			} else if (isAgentSessionPromptedWebhook(webhook)) {
+				this.markIssueCommentSeen(webhook.agentActivity?.sourceCommentId);
 				await this.handleUserPromptedAgentActivity(webhook);
 			} else if (isIssueStateChangeWebhook(webhook)) {
 				// Intentional early return: state changes are handled exclusively via the message bus
@@ -4363,6 +4390,142 @@ ${taskSection}`;
 			// Always decrement counter when webhook processing completes
 			this.activeWebhookCount--;
 		}
+	}
+
+	/**
+	 * Remember a comment that reached a session through an agent session
+	 * event, so the "issueNewComment" notification for the same comment is
+	 * not delivered a second time.
+	 */
+	private markIssueCommentSeen(commentId: string | undefined | null): void {
+		if (commentId) this.seenIssueCommentIds.add(commentId);
+	}
+
+	/**
+	 * A plain comment on an issue Cyrus is working on: deliver it to the
+	 * newest Cyrus session for the issue as if it had been posted in the
+	 * agent session thread. Ignored when it was written by Cyrus or another
+	 * app, when it sits in an agent session thread (Linear already sends
+	 * those as "prompted"), when it started an agent session (an @mention),
+	 * or when the issue is no longer delegated or assigned to Cyrus. See
+	 * IssueCommentReplies.ts.
+	 */
+	private async handleIssueNewCommentWebhook(
+		webhook: IssueNewCommentWebhook,
+	): Promise<void> {
+		if (this.config.issueCommentsAsReplies === false) return;
+
+		const notification =
+			webhook.notification as unknown as IssueCommentNotification;
+		const commentId = notification.commentId ?? notification.comment?.id;
+		const issueId = notification.issueId ?? notification.issue?.id;
+		const actorId = notification.actorId ?? notification.actor?.id;
+		if (!commentId || !issueId) return;
+		if (this.seenIssueCommentIds.has(commentId)) {
+			this.logger.debug(`Issue comment ${commentId} already delivered`);
+			return;
+		}
+		// Comments synced from outside Linear (no Linear user) and Cyrus's own
+		// comments are not replies.
+		if (!actorId || actorId === webhook.appUserId) return;
+
+		const session = newestLinearSession(
+			this.agentSessionManager.getSessionsByIssueId(issueId),
+		);
+		if (!session) return;
+
+		const linearWorkspaceId = webhook.organizationId;
+		const issueTracker = this.issueTrackers.get(linearWorkspaceId);
+		if (!issueTracker) return;
+
+		// Claim the id before any await so a duplicate delivery that arrives
+		// meanwhile is dropped.
+		this.seenIssueCommentIds.add(commentId);
+
+		const issueLabel =
+			notification.issue?.identifier ?? session.issue?.identifier ?? issueId;
+		let skipReason: string | null;
+		try {
+			skipReason = await this.issueCommentSkipReason(
+				issueTracker,
+				commentId,
+				notification.parentCommentId ?? undefined,
+				issueId,
+				webhook.appUserId,
+			);
+		} catch (error) {
+			this.logger.warn(
+				`Could not check issue comment ${commentId} on ${issueLabel}; not delivering it`,
+				error instanceof Error ? error : new Error(String(error)),
+			);
+			return;
+		}
+		if (skipReason) {
+			this.logger.debug(
+				`Issue comment ${commentId} on ${issueLabel} not delivered: ${skipReason}`,
+			);
+			return;
+		}
+
+		const authorName = notification.actor?.name || "A user";
+		const body = notification.comment?.body ?? "";
+		this.logger.info(
+			`Delivering issue comment ${commentId} by ${authorName} on ${issueLabel} to session ${session.id}`,
+		);
+		await this.promptSessionInternally(
+			session.id,
+			{
+				id: issueId,
+				identifier: issueLabel,
+				title: notification.issue?.title ?? session.issue?.title ?? "",
+			},
+			linearWorkspaceId,
+			issueCommentReplyPrompt(authorName, body),
+			{
+				commentId,
+				author: {
+					id: actorId,
+					name: notification.actor?.name,
+					email: notification.actor?.email,
+				},
+			},
+		);
+	}
+
+	/**
+	 * Why a plain issue comment must not reach the session, or null when it
+	 * should. Reads the comment (and its parent) and the issue from Linear.
+	 */
+	private async issueCommentSkipReason(
+		issueTracker: IIssueTrackerService,
+		commentId: string,
+		parentCommentId: string | undefined,
+		issueId: string,
+		appUserId: string,
+	): Promise<string | null> {
+		const comment = await issueTracker.fetchComment(commentId);
+		const facts = comment as unknown as FetchedCommentFacts;
+		if (facts.botActor) return "written by an app or integration";
+		const author = (await comment.user) as { app?: boolean } | undefined;
+		if (author?.app) return "written by an app user";
+		if (facts.agentSessionId) return "part of an agent session";
+
+		const parentId = parentCommentId ?? facts.parentId ?? undefined;
+		if (parentId) {
+			const parent = await issueTracker.fetchComment(parentId);
+			if ((parent as unknown as FetchedCommentFacts).agentSessionId) {
+				return "reply in an agent session thread";
+			}
+		}
+
+		const issue = (await issueTracker.fetchIssue(issueId)) as unknown as {
+			delegateId?: string | null;
+			assigneeId?: string | null;
+		};
+		if (issue.delegateId !== appUserId && issue.assigneeId !== appUserId) {
+			return "issue is no longer delegated or assigned to Cyrus";
+		}
+		return null;
 	}
 
 	// ============================================================================

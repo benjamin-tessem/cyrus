@@ -672,6 +672,9 @@
 		"issueUpdateTrigger": {
 			"type": "boolean"
 		},
+		"issueCommentsAsReplies": {
+			"type": "boolean"
+		},
 		"maxConcurrentSessions": {
 			"type": "integer",
 			"exclusiveMinimum": 0,

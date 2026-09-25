@@ -523,6 +523,10 @@ Sets default allowed tools for each prompt type across all repositories. Reposit
 
 Path to a script that runs for all repositories when creating new worktrees. See the main README for details on setup scripts.
 
+### `issueCommentsAsReplies` (boolean, default `true`)
+
+A plain comment on an issue that Cyrus is working on reaches Cyrus's newest session for that issue, as if it had been posted in the agent session thread. Only comments by people count (not by Cyrus or other apps), only while the issue is still delegated or assigned to Cyrus, and only comments outside an agent session thread (those already arrive as replies). The user access control rules apply to the comment's author. Requires the Linear OAuth app's **Inbox notifications** webhook events. Set to `false` to only listen to the agent session thread.
+
 ---
 
 ## Tool Configuration Priority

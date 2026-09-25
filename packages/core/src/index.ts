@@ -159,6 +159,7 @@ export type {
 	IIssueTrackerService,
 	Issue,
 	IssueDeletedWebhook,
+	IssueNewCommentWebhook,
 	IssueRelation,
 	IssueStateChangeWebhook,
 	IssueUnassignedWebhook,

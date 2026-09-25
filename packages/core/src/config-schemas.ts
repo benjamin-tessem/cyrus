@@ -567,6 +567,14 @@ export const EdgeConfigSchema = z.object({
 	issueUpdateTrigger: z.boolean().optional(),
 
 	/**
+	 * Whether a plain comment on an issue that Cyrus is working on counts as
+	 * a reply to Cyrus's newest session for that issue, as if it had been
+	 * posted in the agent session thread. Needs the Linear OAuth app to
+	 * receive inbox notification webhooks. Defaults to true if not specified.
+	 */
+	issueCommentsAsReplies: z.boolean().optional(),
+
+	/**
 	 * Maximum number of agent runner sessions allowed to execute concurrently
 	 * across all repositories and platforms. Additional session starts wait in
 	 * FIFO order for a free slot and begin automatically as running sessions

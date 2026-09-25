@@ -127,6 +127,7 @@ describe("WorkerService", () => {
 			githubMcpConfigs: ["~/github.json"],
 			strictMcpConfig: false,
 			issueUpdateTrigger: false,
+			issueCommentsAsReplies: false,
 			slackThreadFollowing: false,
 			prReviewTrigger: false,
 			userAccessControl: { allowedUsers: ["usr_1"] },

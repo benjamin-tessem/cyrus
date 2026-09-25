@@ -137,7 +137,7 @@ For Vertex AI, Azure, AWS Bedrock, and other providers, see the [Third-Party Int
    - **Webhook URL:** `https://your-public-url.com/linear-webhook`
    - **App events** - Check these boxes:
      - **Agent session events** (REQUIRED - makes Cyrus appear as agent)
-     - **Inbox notifications** (recommended)
+     - **Inbox notifications** (recommended - lets plain issue comments reach Cyrus's session, see `issueCommentsAsReplies`)
      - **Permission changes** (recommended)
 
 6. Click **Save**

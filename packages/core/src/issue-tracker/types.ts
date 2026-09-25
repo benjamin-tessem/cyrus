@@ -788,6 +788,16 @@ export type IssueUnassignedWebhook =
 	LinearSDK.LinearDocument.AppUserNotificationWebhookPayload;
 
 /**
+ * Platform-agnostic issue new comment webhook payload.
+ * Maps to Linear SDK's AppUserNotificationWebhookPayload with action
+ * "issueNewComment": a comment was added to an issue the app user is
+ * subscribed to. `notification` carries the comment, its author (`actor`),
+ * the issue and, for a reply, the parent comment.
+ */
+export type IssueNewCommentWebhook =
+	LinearSDK.LinearDocument.AppUserNotificationWebhookPayload;
+
+/**
  * Platform-agnostic issue update webhook payload.
  * Maps to Linear SDK's EntityWebhookPayload with issue-specific data.
  *
@@ -889,7 +899,7 @@ export function isIssueCommentMentionWebhook(
  */
 export function isIssueNewCommentWebhook(
 	webhook: Webhook,
-): webhook is LinearSDK.LinearDocument.AppUserNotificationWebhookPayload {
+): webhook is IssueNewCommentWebhook {
 	return (
 		webhook.type === "AppUserNotification" &&
 		webhook.action === "issueNewComment"
