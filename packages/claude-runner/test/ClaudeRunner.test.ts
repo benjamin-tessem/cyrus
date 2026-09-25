@@ -675,6 +675,45 @@ describe("ClaudeRunner", () => {
 			expect(sessionInfo.sessionId).toBeNull();
 		});
 
+		it("logs the run's cost, turns and duration on session_completed", async () => {
+			const logSpy = vi.spyOn(console, "log");
+			mockQuery.mockImplementation(async function* () {
+				yield {
+					type: "assistant",
+					message: { content: [{ type: "text", text: "Done" }] },
+					session_id: "cost-session",
+				} as any;
+				yield {
+					type: "result",
+					subtype: "success",
+					total_cost_usd: 0.4213,
+					num_turns: 7,
+					duration_ms: 65000,
+					session_id: "cost-session",
+				} as any;
+			});
+
+			await new ClaudeRunner({
+				...defaultConfig,
+				model: "opus",
+				effort: "high",
+			}).start("test");
+
+			const line = logSpy.mock.calls
+				.map((call) => String(call[0]))
+				.find((l) => l.includes("[event:session_completed]"));
+			expect(line).toBeDefined();
+			const attrs = JSON.parse(line!.slice(line!.indexOf("{")));
+			expect(attrs).toMatchObject({
+				model: "opus",
+				effort: "high",
+				resultSubtype: "success",
+				costUsd: 0.4213,
+				numTurns: 7,
+				durationMs: 65000,
+			});
+		});
+
 		it("should only extract session ID once from first message that has it", async () => {
 			const logSpy = vi.spyOn(console, "log");
 

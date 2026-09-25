@@ -857,9 +857,27 @@ export class ClaudeRunner extends EventEmitter implements IAgentRunner {
 
 			// Session completed successfully - mark as not running BEFORE emitting result
 			// This ensures any code checking isRunning() during result processing sees the correct state
+			// The run's usage, from its last result message, so logs can answer
+			// "what did this cost and how long did it take" per session.
+			const lastResult = [...this.messages]
+				.reverse()
+				.find((m) => m.type === "result") as
+				| {
+						subtype?: string;
+						total_cost_usd?: number;
+						num_turns?: number;
+						duration_ms?: number;
+				  }
+				| undefined;
 			this.logger.event("session_completed", {
 				messageCount: this.messages.length,
 				claudeSessionId: this.sessionInfo?.sessionId,
+				model: this.config.model,
+				effort: this.config.effort,
+				resultSubtype: lastResult?.subtype,
+				costUsd: lastResult?.total_cost_usd,
+				numTurns: lastResult?.num_turns,
+				durationMs: lastResult?.duration_ms,
 			});
 			this.sessionInfo.isRunning = false;
 
